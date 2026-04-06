@@ -59,11 +59,14 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Run { config } => {
-            let config_path = config
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("config.toml"));
+            let config_source = config.unwrap_or_else(|| "config.toml".into());
 
-            let mut cfg = config::load_config(&config_path)?;
+            let mut cfg = if config_source.starts_with("http://") || config_source.starts_with("https://") {
+                info!(url = %config_source, "fetching remote config");
+                config::load_config_from_url(&config_source).await?
+            } else {
+                config::load_config(&PathBuf::from(&config_source))?
+            };
             info!(
                 agent_cmd = %cfg.agent.command,
                 pool_max = cfg.pool.max_sessions,
