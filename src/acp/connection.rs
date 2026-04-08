@@ -294,9 +294,11 @@ impl AcpConnection {
 #[cfg(test)]
 mod tests {
     use super::AcpConnection;
+    use crate::acp::protocol::{classify_notification, AcpEvent};
     use anyhow::Result;
     use std::collections::HashMap;
     use std::process::Command;
+    use tokio::time::{timeout, Duration};
 
     fn qwen_available() -> bool {
         Command::new("qwen")
@@ -319,7 +321,35 @@ mod tests {
         conn.initialize().await?;
 
         match conn.session_new(".").await {
-            Ok(session_id) => assert!(!session_id.is_empty(), "session id should not be empty"),
+            Ok(session_id) => {
+                assert!(!session_id.is_empty(), "session id should not be empty");
+
+                let (mut rx, _) = conn
+                    .session_prompt("Reply with exactly one word: ACK")
+                    .await?;
+                let mut text = String::new();
+
+                loop {
+                    let Some(notification) = timeout(Duration::from_secs(30), rx.recv()).await?
+                    else {
+                        break;
+                    };
+
+                    if notification.id.is_some() {
+                        break;
+                    }
+
+                    if let Some(AcpEvent::Text(chunk)) = classify_notification(&notification) {
+                        text.push_str(&chunk);
+                    }
+                }
+
+                conn.prompt_done().await;
+                assert!(
+                    text.to_ascii_uppercase().contains("ACK"),
+                    "expected ACK in response, got: {text}"
+                );
+            }
             Err(err) => {
                 let err_text = err.to_string();
                 assert!(
