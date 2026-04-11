@@ -2,6 +2,8 @@
 
 A lightweight, secure, cloud-native ACP harness that bridges Discord and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, etc.) over stdio JSON-RPC — delivering the next-generation development experience.
 
+🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://discord.gg/YNksK9M6)** 🎉
+
 ```
 ┌──────────────┐  Gateway WS   ┌──────────────┐  ACP stdio    ┌──────────────┐
 │   Discord    │◄─────────────►│ openab       │──────────────►│  coding CLI  │
@@ -48,6 +50,7 @@ Edit `config.toml`:
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
 allowed_channels = ["YOUR_CHANNEL_ID"]
+# allowed_users = ["YOUR_USER_ID"]  # optional: restrict who can use the bot
 
 [agent]
 command = "kiro-cli"
@@ -108,7 +111,7 @@ helm install openab openab/openab \
   --set agents.kiro.enabled=false \
   --set agents.claude.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.claude.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
-  --set agents.claude.image=ghcr.io/openabdev/openab-claude:78f8d2c \
+  --set agents.claude.image=ghcr.io/openabdev/openab-claude:latest \
   --set agents.claude.command=claude-agent-acp \
   --set agents.claude.workingDir=/home/node
 
@@ -118,7 +121,7 @@ helm install openab openab/openab \
   --set-string 'agents.kiro.discord.allowedChannels[0]=KIRO_CHANNEL_ID' \
   --set agents.claude.discord.botToken="$CLAUDE_BOT_TOKEN" \
   --set-string 'agents.claude.discord.allowedChannels[0]=CLAUDE_CHANNEL_ID' \
-  --set agents.claude.image=ghcr.io/openabdev/openab-claude:78f8d2c \
+  --set agents.claude.image=ghcr.io/openabdev/openab-claude:latest \
   --set agents.claude.command=claude-agent-acp \
   --set agents.claude.workingDir=/home/node
 ```
@@ -221,6 +224,7 @@ Notes:
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"   # supports env var expansion
 allowed_channels = ["123456789"]      # channel ID allowlist
+# allowed_users = ["987654321"]       # user ID allowlist (empty = all users)
 
 [agent]
 command = "kiro-cli"                  # CLI command
