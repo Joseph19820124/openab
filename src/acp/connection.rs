@@ -90,16 +90,40 @@ impl AcpConnection {
                     // Auto-reply session/request_permission
                     if msg.method.as_deref() == Some("session/request_permission") {
                         if let Some(id) = msg.id {
-                            let title = msg
-                                .params
-                                .as_ref()
+                            let params = msg.params.as_ref();
+                            let title = params
                                 .and_then(|p| p.get("toolCall"))
                                 .and_then(|t| t.get("title"))
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("?");
-                            info!(title, "auto-allow permission");
-                            let reply =
-                                JsonRpcResponse::new(id, json!({"optionId": "allow_always"}));
+
+                            // Dynamically select optionId (Issue #111)
+                            let options = params.and_then(|p| p.get("options")).and_then(|o| o.as_array());
+                            let mut selected_id = "allow_always".to_string(); // Default fallback
+                            
+                            if let Some(opts) = options {
+                                let ids: Vec<&str> = opts.iter()
+                                    .filter_map(|o| o.get("id").and_then(|id| id.as_str()))
+                                    .collect();
+                                
+                                if ids.contains(&"allow_always") {
+                                    selected_id = "allow_always".to_string();
+                                } else if ids.contains(&"allow_once") {
+                                    selected_id = "allow_once".to_string();
+                                } else if let Some(first_id) = ids.first() {
+                                    selected_id = first_id.to_string();
+                                }
+                            }
+
+                            info!(title, %selected_id, "auto-allow permission");
+                            let reply = JsonRpcResponse::new(
+                                id,
+                                json!({
+                                    "outcome": {
+                                        "optionId": selected_id
+                                    }
+                                }),
+                            );
                             if let Ok(data) = serde_json::to_string(&reply) {
                                 let mut w = stdin_clone.lock().await;
                                 let _ = w.write_all(format!("{data}\n").as_bytes()).await;
@@ -193,7 +217,12 @@ impl AcpConnection {
 
         self.send_raw(&data).await?;
 
-        let timeout_secs = if method == "session/new" { 120 } else { 30 };
+        let timeout_secs = match method {
+            // Some ACP backends need a longer cold-start before they can answer initialize.
+            "initialize" => 90,
+            "session/new" => 120,
+            _ => 30,
+        };
         let resp = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
             .await
             .map_err(|_| anyhow!("timeout waiting for {method} response"))?
