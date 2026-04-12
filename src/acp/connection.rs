@@ -10,6 +10,26 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 
+fn pick_best_option(options: &[Value]) -> Option<String> {
+    let mut best: Option<(String, i32)> = None;
+    for opt in options {
+        let id = opt.get("optionId").and_then(|i| i.as_str()).unwrap_or("");
+        let kind = opt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        
+        let priority = match kind {
+            "allow_always" => 2,
+            "allow_once" => 1,
+            _ if kind != "reject_once" && kind != "reject_always" => 0,
+            _ => -1,
+        };
+        
+        if priority >= 0 && priority > best.as_ref().map(|b| b.1).unwrap_or(-1) {
+            best = Some((id.to_string(), priority));
+        }
+    }
+    best.map(|b| b.0)
+}
+
 fn expand_env(val: &str) -> String {
     if val.starts_with("${") && val.ends_with('}') {
         let key = &val[2..val.len() - 1];
@@ -90,13 +110,30 @@ impl AcpConnection {
                     // Auto-reply session/request_permission
                     if msg.method.as_deref() == Some("session/request_permission") {
                         if let Some(id) = msg.id {
-                            let title = msg.params.as_ref()
+                            let params = msg.params.as_ref();
+                            let title = params
                                 .and_then(|p| p.get("toolCall"))
                                 .and_then(|t| t.get("title"))
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("?");
-                            info!(title, "auto-allow permission");
-                            let reply = JsonRpcResponse::new(id, json!({"optionId": "allow_always"}));
+                            
+                            let options = params.and_then(|p| p.get("options")).and_then(|o| o.as_array());
+                            
+                            let outcome = if let Some(opts) = options {
+                                if opts.is_empty() {
+                                    tracing::warn!("no permission options provided");
+                                    json!({"outcome": "selected", "optionId": "allow_always"})
+                                } else if let Some(option_id) = pick_best_option(opts) {
+                                    json!({"outcome": "selected", "optionId": option_id})
+                                } else {
+                                    json!({"outcome": "cancelled"})
+                                }
+                            } else {
+                                json!({"outcome": "selected", "optionId": "allow_always"})
+                            };
+
+                            info!(title, %outcome, "auto-allow permission");
+                            let reply = JsonRpcResponse::new(id, json!({"outcome": outcome}));
                             if let Ok(data) = serde_json::to_string(&reply) {
                                 let mut w = stdin_clone.lock().await;
                                 let _ = w.write_all(format!("{data}\n").as_bytes()).await;
@@ -284,5 +321,29 @@ impl AcpConnection {
 
     pub fn alive(&self) -> bool {
         !self._reader_handle.is_finished()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::protocol::{classify_notification, AcpEvent};
+    use anyhow::Result;
+    use std::collections::HashMap;
+    use std::process::Command;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn test_permission_selection() {
+        use serde_json::json;
+        let opts = json!([
+            {"optionId": "bypassPermissions", "kind": "allow_always"},
+            {"optionId": "reject_once", "kind": "reject_once"},
+            {"optionId": "allow_once", "kind": "allow_once"}
+        ]);
+        let opts_arr = opts.as_array().unwrap();
+        
+        let best_id = pick_best_option(opts_arr);
+        assert_eq!(best_id, Some("bypassPermissions".to_string()));
     }
 }
