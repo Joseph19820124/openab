@@ -471,8 +471,13 @@ async fn stream_prompt(
                             let content = buf_rx.borrow_and_update().clone();
                             if content != last_content {
                                 let display = if content.chars().count() > 1900 {
-                                    let truncated = format::truncate_chars(&content, 1900);
-                                    format!("{truncated}…")
+                                    // Tail-priority: keep the last 1900 chars so the
+                                    // user always sees the most recent agent output
+                                    // (e.g. a confirmation prompt) instead of old tool lines.
+                                    let total = content.chars().count();
+                                    let skip = total - 1900;
+                                    let truncated: String = content.chars().skip(skip).collect();
+                                    format!("…(truncated)\n{truncated}")
                                 } else {
                                     content.clone()
                                 };
@@ -507,7 +512,7 @@ async fn stream_prompt(
                                 // Reaction: back to thinking after tools
                             }
                             text_buf.push_str(&t);
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, true));
                         }
                         AcpEvent::Thinking => {
                             reactions.set_thinking().await;
@@ -532,7 +537,7 @@ async fn stream_prompt(
                                     state: ToolState::Running,
                                 });
                             }
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, true));
                         }
                         AcpEvent::ToolDone { id, title, status } => {
                             reactions.set_thinking().await;
@@ -560,7 +565,7 @@ async fn stream_prompt(
                                     state: new_state,
                                 });
                             }
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, true));
                         }
                         _ => {}
                     }
@@ -572,7 +577,7 @@ async fn stream_prompt(
             let _ = edit_handle.await;
 
             // Final edit
-            let final_content = compose_display(&tool_lines, &text_buf);
+            let final_content = compose_display(&tool_lines, &text_buf, false);
             // If ACP returned both an error and partial text, show both.
             // This can happen when the agent started producing content before hitting an error
             // (e.g. context length limit, rate limit mid-stream). Showing both gives users
@@ -640,14 +645,58 @@ impl ToolEntry {
     }
 }
 
-fn compose_display(tool_lines: &[ToolEntry], text: &str) -> String {
+/// Maximum number of finished (or running) tool entries to show individually
+/// during streaming before collapsing into a summary line.
+///
+/// A typical tool line is 40–80 chars (icon + backtick title + suffix).
+/// At 3 lines ≈ 120–240 chars, consuming 6–13 % of the 1900-char Discord
+/// streaming budget, leaving 1660+ chars for agent text.  Beyond 3, tool
+/// titles tend to grow (full shell commands, URLs) so budget consumption
+/// rises non-linearly.  3 is also the practical "glanceable" limit.
+const TOOL_COLLAPSE_THRESHOLD: usize = 3;
+
+fn compose_display(tool_lines: &[ToolEntry], text: &str, streaming: bool) -> String {
     let mut out = String::new();
     if !tool_lines.is_empty() {
-        for entry in tool_lines {
-            out.push_str(&entry.render());
-            out.push('\n');
+        if streaming {
+            let done = tool_lines.iter().filter(|e| e.state == ToolState::Completed).count();
+            let failed = tool_lines.iter().filter(|e| e.state == ToolState::Failed).count();
+            let running: Vec<_> = tool_lines.iter().filter(|e| e.state == ToolState::Running).collect();
+            let finished = done + failed;
+
+            if finished <= TOOL_COLLAPSE_THRESHOLD {
+                for entry in tool_lines.iter().filter(|e| e.state != ToolState::Running) {
+                    out.push_str(&entry.render());
+                    out.push('\n');
+                }
+            } else {
+                let mut parts = Vec::new();
+                if done > 0 { parts.push(format!("✅ {done}")); }
+                if failed > 0 { parts.push(format!("❌ {failed}")); }
+                out.push_str(&format!("{} tool(s) completed\n", parts.join(" · ")));
+            }
+
+            if running.len() <= TOOL_COLLAPSE_THRESHOLD {
+                for entry in &running {
+                    out.push_str(&entry.render());
+                    out.push('\n');
+                }
+            } else {
+                // Parallel running tools exceed threshold — show last N + summary
+                let hidden = running.len() - TOOL_COLLAPSE_THRESHOLD;
+                out.push_str(&format!("🔧 {hidden} more running\n"));
+                for entry in running.iter().skip(hidden) {
+                    out.push_str(&entry.render());
+                    out.push('\n');
+                }
+            }
+        } else {
+            for entry in tool_lines {
+                out.push_str(&entry.render());
+                out.push('\n');
+            }
         }
-        out.push('\n');
+        if !out.is_empty() { out.push('\n'); }
     }
     out.push_str(text.trim_end());
     out
@@ -778,5 +827,105 @@ mod tests {
     fn invalid_data_returns_error() {
         let garbage = vec![0x00, 0x01, 0x02, 0x03];
         assert!(resize_and_compress(&garbage).is_err());
+    }
+
+    // --- compose_display tests ---
+
+    fn tool(id: &str, title: &str, state: ToolState) -> ToolEntry {
+        ToolEntry { id: id.to_string(), title: title.to_string(), state }
+    }
+
+    #[test]
+    fn compose_display_at_threshold_shows_individual_lines() {
+        let tools = vec![
+            tool("1", "cmd-a", ToolState::Completed),
+            tool("2", "cmd-b", ToolState::Completed),
+            tool("3", "cmd-c", ToolState::Completed),
+        ];
+        let out = compose_display(&tools, "hello", true);
+        assert!(out.contains("✅ `cmd-a`"), "should show individual tool");
+        assert!(out.contains("✅ `cmd-b`"), "should show individual tool");
+        assert!(out.contains("✅ `cmd-c`"), "should show individual tool");
+        assert!(!out.contains("tool(s) completed"), "should not collapse at threshold");
+    }
+
+    #[test]
+    fn compose_display_above_threshold_collapses() {
+        let tools = vec![
+            tool("1", "cmd-a", ToolState::Completed),
+            tool("2", "cmd-b", ToolState::Completed),
+            tool("3", "cmd-c", ToolState::Completed),
+            tool("4", "cmd-d", ToolState::Completed),
+        ];
+        let out = compose_display(&tools, "hello", true);
+        assert!(out.contains("✅ 4 tool(s) completed"), "should collapse above threshold");
+        assert!(!out.contains("`cmd-a`"), "individual tools should be hidden");
+    }
+
+    #[test]
+    fn compose_display_mixed_completed_and_failed() {
+        let tools = vec![
+            tool("1", "ok-1", ToolState::Completed),
+            tool("2", "ok-2", ToolState::Completed),
+            tool("3", "ok-3", ToolState::Completed),
+            tool("4", "fail-1", ToolState::Failed),
+            tool("5", "fail-2", ToolState::Failed),
+        ];
+        let out = compose_display(&tools, "", true);
+        assert!(out.contains("✅ 3 · ❌ 2 tool(s) completed"));
+    }
+
+    #[test]
+    fn compose_display_running_shown_alongside_collapsed() {
+        let tools = vec![
+            tool("1", "done-1", ToolState::Completed),
+            tool("2", "done-2", ToolState::Completed),
+            tool("3", "done-3", ToolState::Completed),
+            tool("4", "done-4", ToolState::Completed),
+            tool("5", "active", ToolState::Running),
+        ];
+        let out = compose_display(&tools, "text", true);
+        assert!(out.contains("✅ 4 tool(s) completed"));
+        assert!(out.contains("🔧 `active`..."));
+        assert!(out.contains("text"));
+    }
+
+    #[test]
+    fn compose_display_parallel_running_guard() {
+        let tools: Vec<_> = (0..5)
+            .map(|i| tool(&i.to_string(), &format!("run-{i}"), ToolState::Running))
+            .collect();
+        let out = compose_display(&tools, "", true);
+        assert!(out.contains("🔧 2 more running"), "should collapse excess running tools");
+        assert!(out.contains("🔧 `run-3`..."), "should show recent running");
+        assert!(out.contains("🔧 `run-4`..."), "should show recent running");
+    }
+
+    #[test]
+    fn compose_display_non_streaming_shows_all() {
+        let tools = vec![
+            tool("1", "cmd-a", ToolState::Completed),
+            tool("2", "cmd-b", ToolState::Completed),
+            tool("3", "cmd-c", ToolState::Completed),
+            tool("4", "cmd-d", ToolState::Completed),
+            tool("5", "cmd-e", ToolState::Failed),
+        ];
+        let out = compose_display(&tools, "final", false);
+        assert!(out.contains("✅ `cmd-a`"));
+        assert!(out.contains("✅ `cmd-d`"));
+        assert!(out.contains("❌ `cmd-e`"));
+        assert!(out.contains("final"));
+        assert!(!out.contains("tool(s) completed"), "non-streaming should not collapse");
+    }
+
+    #[test]
+    fn tail_truncation_preserves_multibyte_chars() {
+        let content = "你好世界🌍abcdefghij";
+        let limit = 10;
+        let total = content.chars().count();
+        let skip = total.saturating_sub(limit);
+        let truncated: String = content.chars().skip(skip).collect();
+        assert_eq!(truncated.chars().count(), limit);
+        assert!(truncated.ends_with("abcdefghij"));
     }
 }
