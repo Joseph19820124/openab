@@ -1,5 +1,7 @@
 use crate::acp::protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 use anyhow::{anyhow, Result};
+#[cfg(unix)]
+use libc;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -133,6 +135,8 @@ impl AcpConnection {
             .stderr(std::process::Stdio::null())
             .current_dir(working_dir)
             .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
         for (k, v) in env {
             cmd.env(k, expand_env(v));
         }
@@ -384,10 +388,24 @@ impl AcpConnection {
     }
 }
 
+#[cfg(unix)]
+impl Drop for AcpConnection {
+    fn drop(&mut self) {
+        if let Some(pid) = self._proc.id() {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_permission_response, pick_best_option};
+    use super::{build_permission_response, pick_best_option, AcpConnection};
+    use anyhow::Result;
     use serde_json::json;
+    use std::collections::HashMap;
+    use tokio::time::Duration;
 
     #[test]
     fn picks_allow_always_over_other_options() {
@@ -478,5 +496,53 @@ mod tests {
             response,
             json!({"outcome": {"outcome": "selected", "optionId": "allow_always"}})
         );
+    }
+
+    #[tokio::test]
+    async fn test_process_group_cleanup() -> Result<()> {
+        #[cfg(unix)]
+        {
+            let script = "sh -c 'sleep 100' & sleep 100";
+
+            let conn = AcpConnection::spawn(
+                "sh",
+                &["-c".to_string(), script.to_string()],
+                ".",
+                &HashMap::new(),
+            )
+            .await?;
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let pid = conn._proc.id().expect("should have pid");
+            let output = std::process::Command::new("pgrep")
+                .arg("-P")
+                .arg(pid.to_string())
+                .output()?;
+            let grandchild_pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            assert!(
+                !grandchild_pid_str.is_empty(),
+                "Grandchild process should exist"
+            );
+
+            let grandchild_pid_str = grandchild_pid_str.lines().next().unwrap();
+            let grandchild_pid: i32 = grandchild_pid_str.parse().expect("should be a pid");
+
+            drop(conn);
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let status = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(grandchild_pid.to_string())
+                .status();
+
+            assert!(
+                status.is_err() || !status.unwrap().success(),
+                "Grandchild process should be killed"
+            );
+        }
+
+        Ok(())
     }
 }
