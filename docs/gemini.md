@@ -29,15 +29,29 @@ helm install openab openab/openab \
 
 Gemini CLI needs `~/.gemini/projects.json` to exist before the first ACP session starts. In ephemeral containers, the file may not be created yet, which can surface as `ENOENT` or `Unexpected end of JSON input` during the first run.
 
+This is a workaround for the upstream Gemini CLI issue `google-gemini/gemini-cli#22583`.
+
 If you control the container startup command, seed the directory before launching `openab`:
 
 ```bash
 mkdir -p /home/node/.gemini && echo '{}' > /home/node/.gemini/projects.json && exec openab /etc/openab/config.toml
 ```
 
-For Kubernetes or Helm deployments, use the same idea with an init container and a shared volume mounted at `/home/node/.gemini`.
+The `exec openab /etc/openab/config.toml` part assumes the Docker image default config path.
 
-The current chart does not expose `extraInitContainers`, `extraVolumes`, or `extraVolumeMounts`, so the workaround is easiest to apply in a custom manifest or wrapper image until those values are added.
+For Kubernetes or Helm deployments, use the same idea with an init container and a shared volume mounted at `/home/node/.gemini`. A minimal pattern looks like this:
+
+```yaml
+extraInitContainers:
+  - name: seed-gemini-home
+    image: busybox:1.36
+    command: ["sh", "-c", "mkdir -p /home/node/.gemini && echo '{}' > /home/node/.gemini/projects.json"]
+    volumeMounts:
+      - name: gemini-home
+        mountPath: /home/node/.gemini
+```
+
+The current chart does not expose `extraInitContainers`, `extraVolumes`, or `extraVolumeMounts`, so the workaround is easiest to apply in a custom manifest or wrapper image until those values are added. Chart support for those passthrough fields is tracked in #344.
 
 ## Manual config.toml
 
