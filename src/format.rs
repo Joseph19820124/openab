@@ -60,3 +60,8 @@ pub fn shorten_thread_name(prompt: &str) -> String {
     }
 }
 
+
+/// Truncate a string to at most `limit` Unicode characters.
+pub fn truncate_chars(s: &str, limit: usize) -> String {
+    s.chars().take(limit).collect()
+}

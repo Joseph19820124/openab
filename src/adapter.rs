@@ -73,6 +73,17 @@ pub trait ChatAdapter: Send + Sync + 'static {
 
     /// Remove a reaction/emoji from a message.
     async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()>;
+
+    /// Edit an existing message in-place (for streaming updates).
+    /// Default: unsupported (send-once only).
+    async fn edit_message(&self, _msg: &MessageRef, _content: &str) -> Result<()> {
+        Err(anyhow::anyhow!("edit_message not supported"))
+    }
+
+    /// Whether this adapter should use streaming edit (true) or send-once (false).
+    fn use_streaming(&self) -> bool {
+        false
+    }
 }
 
 // --- AdapterRouter ---
@@ -205,6 +216,7 @@ impl AdapterRouter {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
         let message_limit = adapter.message_limit();
+        let streaming = adapter.use_streaming();
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -223,6 +235,43 @@ impl AdapterRouter {
                         text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
                     }
 
+                    // Streaming edit: send placeholder, spawn edit loop
+                    let (buf_tx, placeholder_msg) = if streaming {
+                        let initial = if reset {
+                            "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
+                        } else {
+                            "…".to_string()
+                        };
+                        let msg = adapter.send_message(&thread_channel, &initial).await?;
+                        let (tx, rx) = tokio::sync::watch::channel(initial);
+                        let edit_adapter = adapter.clone();
+                        let edit_msg = msg.clone();
+                        let limit = message_limit;
+                        let mut buf_rx = rx;
+                        tokio::spawn(async move {
+                            let mut last = String::new();
+                            loop {
+                                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                                if buf_rx.has_changed().unwrap_or(false) {
+                                    let content = buf_rx.borrow_and_update().clone();
+                                    if content != last {
+                                        let display = if content.chars().count() > limit - 100 {
+                                            format!("{}…", format::truncate_chars(&content, limit - 100))
+                                        } else {
+                                            content.clone()
+                                        };
+                                        let _ = edit_adapter.edit_message(&edit_msg, &display).await;
+                                        last = content;
+                                    }
+                                }
+                                if buf_rx.has_changed().is_err() { break; }
+                            }
+                        });
+                        (Some(tx), Some(msg))
+                    } else {
+                        (None, None)
+                    };
+
                     // Process ACP notifications
                     let mut response_error: Option<String> = None;
                     while let Some(notification) = rx.recv().await {
@@ -237,6 +286,9 @@ impl AdapterRouter {
                             match event {
                                 AcpEvent::Text(t) => {
                                     text_buf.push_str(&t);
+                                    if let Some(tx) = &buf_tx {
+                                        let _ = tx.send(compose_display(&tool_lines, &text_buf, true));
+                                    }
                                 }
                                 AcpEvent::Thinking => {
                                     reactions.set_thinking().await;
@@ -253,6 +305,9 @@ impl AdapterRouter {
                                             title,
                                             state: ToolState::Running,
                                         });
+                                    }
+                                    if let Some(tx) = &buf_tx {
+                                        let _ = tx.send(compose_display(&tool_lines, &text_buf, true));
                                     }
                                 }
                                 AcpEvent::ToolDone { id, title, status } => {
@@ -274,6 +329,9 @@ impl AdapterRouter {
                                             state: new_state,
                                         });
                                     }
+                                    if let Some(tx) = &buf_tx {
+                                        let _ = tx.send(compose_display(&tool_lines, &text_buf, true));
+                                    }
                                 }
                                 _ => {}
                             }
@@ -281,8 +339,10 @@ impl AdapterRouter {
                     }
 
                     conn.prompt_done().await;
+                    // Stop the edit loop
+                    drop(buf_tx);
 
-                    // Send complete content as a single new message
+                    // Build final content
                     let final_content = compose_display(&tool_lines, &text_buf, false);
                     let final_content = if final_content.is_empty() {
                         if let Some(err) = response_error {
@@ -297,8 +357,19 @@ impl AdapterRouter {
                     };
 
                     let chunks = format::split_message(&final_content, message_limit);
-                    for chunk in &chunks {
-                        let _ = adapter.send_message(&thread_channel, chunk).await;
+                    if let Some(msg) = placeholder_msg {
+                        // Streaming: edit first chunk into placeholder, send rest as new messages
+                        if let Some(first) = chunks.first() {
+                            let _ = adapter.edit_message(&msg, first).await;
+                        }
+                        for chunk in chunks.iter().skip(1) {
+                            let _ = adapter.send_message(&thread_channel, chunk).await;
+                        }
+                    } else {
+                        // Send-once: all chunks as new messages
+                        for chunk in &chunks {
+                            let _ = adapter.send_message(&thread_channel, chunk).await;
+                        }
                     }
 
                     Ok(())

@@ -63,10 +63,12 @@ pub struct SlackAdapter {
     participated_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
     /// TTL for participation cache entries (matches session_ttl_hours from config).
     session_ttl: std::time::Duration,
+    /// Controls streaming behavior: Off → streaming edit, Mentions/All → send-once.
+    allow_bot_messages: AllowBots,
 }
 
 impl SlackAdapter {
-    pub fn new(bot_token: String, session_ttl: std::time::Duration) -> Self {
+    pub fn new(bot_token: String, session_ttl: std::time::Duration, allow_bot_messages: AllowBots) -> Self {
         Self {
             client: reqwest::Client::new(),
             bot_token,
@@ -75,6 +77,7 @@ impl SlackAdapter {
             bot_id_cache: tokio::sync::Mutex::new(HashMap::new()),
             participated_threads: tokio::sync::Mutex::new(HashMap::new()),
             session_ttl,
+            allow_bot_messages,
         }
     }
 
@@ -369,6 +372,24 @@ impl ChatAdapter for SlackAdapter {
             Err(e) => Err(e),
         }
     }
+
+    async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
+        let mrkdwn = markdown_to_mrkdwn(content);
+        self.api_post(
+            "chat.update",
+            serde_json::json!({
+                "channel": msg.channel.channel_id,
+                "ts": msg.message_id,
+                "text": mrkdwn,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn use_streaming(&self) -> bool {
+        self.allow_bot_messages == AllowBots::Off
+    }
 }
 
 // --- Per-thread async queue (inspired by OpenClaw's KeyedAsyncQueue) ---
@@ -433,7 +454,7 @@ pub async fn run_slack_adapter(
     router: Arc<AdapterRouter>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let adapter = Arc::new(SlackAdapter::new(bot_token.clone(), session_ttl));
+    let adapter = Arc::new(SlackAdapter::new(bot_token.clone(), session_ttl, allow_bot_messages));
     let queue = Arc::new(KeyedAsyncQueue::new());
 
     loop {
