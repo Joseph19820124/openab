@@ -1,6 +1,8 @@
 name: Label pending-maintainer PRs
 
 on:
+  schedule:
+    - cron: '0 * * * *'  # hourly safety net
   issue_comment:
     types: [created]
   pull_request_review:
@@ -9,7 +11,7 @@ on:
 
 jobs:
   check-pending:
-    if: github.event_name == 'workflow_dispatch' || github.event.issue.pull_request != null || github.event.pull_request != null
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.issue.pull_request != null || github.event.pull_request != null
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -24,7 +26,7 @@ jobs:
 
             let prNumbers = [];
 
-            if (context.eventName === 'workflow_dispatch') {
+            if (context.eventName === 'workflow_dispatch' || context.eventName === 'schedule') {
               const prs = await github.rest.pulls.list({
                 ...context.repo,
                 state: 'open',
