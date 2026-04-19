@@ -42,7 +42,7 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 <details>
 <summary><strong>Discord</strong></summary>
 
-See [docs/discord-bot-howto.md](docs/discord-bot-howto.md) for a detailed step-by-step guide.
+See [docs/discord.md](docs/discord.md) for a detailed step-by-step guide.
 
 </details>
 
