@@ -1,4 +1,4 @@
-use crate::acp::protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
+use crate::acp::protocol::{ConfigOption, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, parse_config_options};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -115,6 +115,7 @@ pub struct AcpConnection {
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
+    pub config_options: Vec<ConfigOption>,
     pub last_active: Instant,
     pub session_reset: bool,
     _reader_handle: JoinHandle<()>,
@@ -268,6 +269,7 @@ impl AcpConnection {
             notify_tx,
             acp_session_id: None,
             supports_load_session: false,
+            config_options: Vec::new(),
             last_active: Instant::now(),
             session_reset: false,
             _reader_handle: reader_handle,
@@ -352,7 +354,40 @@ impl AcpConnection {
 
         info!(session_id = %session_id, "session created");
         self.acp_session_id = Some(session_id.clone());
+        if let Some(result) = resp.result.as_ref() {
+            self.config_options = parse_config_options(result);
+            if !self.config_options.is_empty() {
+                info!(count = self.config_options.len(), "parsed configOptions");
+            }
+        }
         Ok(session_id)
+    }
+
+    /// Set a config option (e.g. model, mode) via ACP session/set_config_option.
+    /// Returns the updated list of all config options.
+    pub async fn set_config_option(&mut self, config_id: &str, value: &str) -> Result<Vec<ConfigOption>> {
+        let session_id = self
+            .acp_session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("no session"))?
+            .clone();
+
+        let resp = self
+            .send_request(
+                "session/set_config_option",
+                Some(json!({
+                    "sessionId": session_id,
+                    "configId": config_id,
+                    "value": value,
+                })),
+            )
+            .await?;
+
+        if let Some(result) = resp.result.as_ref() {
+            self.config_options = parse_config_options(result);
+        }
+        info!(config_id, value, "config option set");
+        Ok(self.config_options.clone())
     }
 
     /// Send a prompt with content blocks (text and/or images) and return a receiver
@@ -422,6 +457,9 @@ impl AcpConnection {
         }
         info!(session_id, "session loaded");
         self.acp_session_id = Some(session_id.to_string());
+        if let Some(result) = resp.result.as_ref() {
+            self.config_options = parse_config_options(result);
+        }
         Ok(())
     }
 

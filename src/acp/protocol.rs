@@ -54,6 +54,39 @@ impl std::fmt::Display for JsonRpcError {
     }
 }
 
+// --- ACP configOptions (session-level configuration) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigOptionValue {
+    pub value: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigOption {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(rename = "type")]
+    pub option_type: String,
+    pub current_value: String,
+    pub options: Vec<ConfigOptionValue>,
+}
+
+/// Extract configOptions from a JSON-RPC result value.
+pub fn parse_config_options(result: &Value) -> Vec<ConfigOption> {
+    result
+        .get("configOptions")
+        .and_then(|v| serde_json::from_value::<Vec<ConfigOption>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
 // --- ACP notification classification ---
 
 #[derive(Debug)]
@@ -62,6 +95,7 @@ pub enum AcpEvent {
     Thinking,
     ToolStart { id: String, title: String },
     ToolDone { id: String, title: String, status: String },
+    ConfigUpdate { options: Vec<ConfigOption> },
     Status,
 }
 
@@ -105,6 +139,10 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
             }
         }
         "plan" => Some(AcpEvent::Status),
+        "config_option_update" => {
+            let options = parse_config_options(update);
+            Some(AcpEvent::ConfigUpdate { options })
+        }
         _ => None,
     }
 }

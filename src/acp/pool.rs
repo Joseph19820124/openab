@@ -1,4 +1,5 @@
 use crate::acp::connection::AcpConnection;
+use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -227,6 +228,37 @@ impl SessionPool {
 
         let mut conn = conn.lock().await;
         f(&mut conn).await
+    }
+
+    /// Get cached configOptions for a session (e.g. available models).
+    pub async fn get_config_options(&self, thread_id: &str) -> Vec<ConfigOption> {
+        let state = self.state.read().await;
+        let conn = match state.active.get(thread_id) {
+            Some(c) => c.clone(),
+            None => return Vec::new(),
+        };
+        drop(state);
+        let conn = conn.lock().await;
+        conn.config_options.clone()
+    }
+
+    /// Set a config option (e.g. model) via ACP and return updated options.
+    pub async fn set_config_option(
+        &self,
+        thread_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<ConfigOption>> {
+        let conn = {
+            let state = self.state.read().await;
+            state
+                .active
+                .get(thread_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("no connection for thread {thread_id}"))?
+        };
+        let mut conn = conn.lock().await;
+        conn.set_config_option(config_id, value).await
     }
 
     pub async fn cleanup_idle(&self, ttl_secs: u64) {

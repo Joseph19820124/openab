@@ -103,6 +103,11 @@ impl AdapterRouter {
         }
     }
 
+    /// Access the underlying session pool (e.g. for config option queries).
+    pub fn pool(&self) -> &Arc<SessionPool> {
+        &self.pool
+    }
+
     /// Handle an incoming user message. The adapter is responsible for
     /// filtering, resolving the thread, and building the SenderContext.
     /// This method handles sender context injection, session management, and streaming.
@@ -340,6 +345,9 @@ impl AdapterRouter {
                                     if let Some(tx) = &buf_tx {
                                         let _ = tx.send(compose_display(&tool_lines, &text_buf, true));
                                     }
+                                }
+                                AcpEvent::ConfigUpdate { options } => {
+                                    conn.config_options = options;
                                 }
                                 _ => {}
                             }

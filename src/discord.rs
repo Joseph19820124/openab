@@ -1,12 +1,14 @@
 use crate::acp::ContentBlock;
+use crate::acp::protocol::ConfigOption;
 use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
 use crate::media;
 use async_trait::async_trait;
 use std::sync::LazyLock;
-use serenity::builder::CreateThread;
+use serenity::builder::{CreateActionRow, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread};
 use serenity::http::Http;
+use serenity::model::application::{ComponentInteractionDataKind, Interaction};
 use serenity::model::channel::{AutoArchiveDuration, Message, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
@@ -523,8 +525,169 @@ impl EventHandler for Handler {
         });
     }
 
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, "discord bot connected");
+
+        // Register /model slash command to all guilds the bot is in
+        for guild in &ready.guilds {
+            let guild_id = guild.id;
+            if let Err(e) = guild_id
+                .set_commands(
+                    &ctx.http,
+                    vec![
+                        CreateCommand::new("models")
+                            .description("Select the AI model for this session"),
+                    ],
+                )
+                .await
+            {
+                tracing::warn!(%guild_id, error = %e, "failed to register slash commands");
+            } else {
+                info!(%guild_id, "registered slash commands");
+            }
+        }
+    }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        match interaction {
+            Interaction::Command(cmd) if cmd.data.name == "models" => {
+                self.handle_model_command(&ctx, &cmd).await;
+            }
+            Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
+                self.handle_config_select(&ctx, &comp).await;
+            }
+            _ => {}
+        }
+    }
+}
+
+
+// --- Slash command & interaction handlers ---
+
+impl Handler {
+    /// Build a Discord select menu from ACP configOptions with the given category.
+    fn build_config_select(options: &[ConfigOption], category: &str) -> Option<CreateSelectMenu> {
+        let opt = options.iter().find(|o| o.category.as_deref() == Some(category))?;
+        let menu_options: Vec<CreateSelectMenuOption> = opt
+            .options
+            .iter()
+            .map(|o| {
+                let mut item = CreateSelectMenuOption::new(&o.name, &o.value);
+                if let Some(desc) = &o.description {
+                    item = item.description(desc);
+                }
+                if o.value == opt.current_value {
+                    item = item.default_selection(true);
+                }
+                item
+            })
+            .collect();
+
+        if menu_options.is_empty() {
+            return None;
+        }
+
+        Some(
+            CreateSelectMenu::new(
+                format!("acp_config_{}", opt.id),
+                CreateSelectMenuKind::String { options: menu_options },
+            )
+            .placeholder(format!("Current: {}", opt.options.iter()
+                .find(|o| o.value == opt.current_value)
+                .map(|o| o.name.as_str())
+                .unwrap_or(&opt.current_value)))
+        )
+    }
+
+    async fn handle_model_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        // thread_key must match the format used in adapter.rs handle_message:
+        // "{platform}:{channel_or_thread_id}"
+        let thread_key = format!("discord:{}", cmd.channel_id.get());
+
+        let config_options = self.router.pool().get_config_options(&thread_key).await;
+
+        let select = Self::build_config_select(&config_options, "model");
+
+        let response = match select {
+            Some(menu) => CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🔧 Select a model:")
+                    .components(vec![CreateActionRow::SelectMenu(menu)])
+                    .ephemeral(true),
+            ),
+            None => CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ No model options available. Start a conversation first by @mentioning the bot.")
+                    .ephemeral(true),
+            ),
+        };
+
+        if let Err(e) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, "failed to respond to /model command");
+        }
+    }
+
+    async fn handle_config_select(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        let config_id = comp
+            .data
+            .custom_id
+            .strip_prefix("acp_config_")
+            .unwrap_or("")
+            .to_string();
+
+        if config_id.is_empty() {
+            return;
+        }
+
+        let selected_value = match &comp.data.kind {
+            ComponentInteractionDataKind::StringSelect { values } => {
+                match values.first() {
+                    Some(v) => v.clone(),
+                    None => return,
+                }
+            }
+            _ => return,
+        };
+
+        let thread_key = format!("discord:{}", comp.channel_id.get());
+
+        let result = self
+            .router
+            .pool()
+            .set_config_option(&thread_key, &config_id, &selected_value)
+            .await;
+
+        let response_msg = match result {
+            Ok(updated_options) => {
+                let display_name = updated_options
+                    .iter()
+                    .find(|o| o.id == config_id)
+                    .and_then(|o| o.options.iter().find(|v| v.value == selected_value))
+                    .map(|v| v.name.as_str())
+                    .unwrap_or(&selected_value);
+                format!("✅ Switched to **{}**", display_name)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to set config option");
+                format!("❌ Failed to switch: {}", e)
+            }
+        };
+
+        let response = CreateInteractionResponse::UpdateMessage(
+            CreateInteractionResponseMessage::new().content(response_msg).components(vec![]),
+        );
+
+        if let Err(e) = comp.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, "failed to respond to config select");
+        }
     }
 }
 
