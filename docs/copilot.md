@@ -38,40 +38,80 @@ docker build -f Dockerfile.copilot -t openab-copilot .
 
 ## Authentication
 
-Copilot CLI uses GitHub OAuth (same as `gh` CLI). In a headless container, use device flow:
+Copilot CLI has two independent auth layers that can use **different** GitHub accounts:
+
+1. **Copilot subscription auth** — authenticates your Copilot subscription (model access)
+2. **`gh` CLI auth** — authenticates git operations (clone, push, PR creation)
+
+This separation lets you use a subscription owner's token for Copilot while scoping git operations to a different GitHub user (e.g. a bot account).
+
+### Step 1: Copilot Subscription (fine-grained PAT)
+
+Generate a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new) from the GitHub account that owns the Copilot subscription:
+
+- Token name: e.g. `openab-copilot`
+- Expiration: as needed
+- **Account permissions → Copilot Requests: Read-only** (this is the only permission required)
+
+Inject it as an env var in your Helm chart:
 
 ```bash
-# 1. Exec into the running pod/container
-kubectl exec -it deployment/openab-copilot -- bash
-
-# 2. Authenticate via device flow
-gh auth login --hostname github.com --git-protocol https -p https -w
-
-# 3. Follow the device code flow in your browser
-
-# 4. Verify
-gh auth status
-
-# 5. Restart the pod (token is persisted via PVC)
-kubectl rollout restart deployment/openab-copilot
+helm install openab-copilot openab/openab \
+  --set agents.kiro.enabled=false \
+  --set agents.copilot.discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set-string 'agents.copilot.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
+  --set agents.copilot.discord.enabled=true \
+  --set agents.copilot.image=ghcr.io/openabdev/openab-copilot \
+  --set agents.copilot.command=copilot \
+  --set 'agents.copilot.args={--acp,--stdio}' \
+  --set agents.copilot.persistence.enabled=true \
+  --set agents.copilot.workingDir=/home/node \
+  --set 'agents.copilot.env.COPILOT_GITHUB_TOKEN=github_pat_YOUR_TOKEN_HERE'
 ```
 
-The OAuth token is stored under `~/.config/gh/` and persisted across pod restarts via PVC.
+Copilot CLI reads `COPILOT_GITHUB_TOKEN` automatically — no interactive login needed.
 
-> **Note**: See [docs/gh-auth-device-flow.md](gh-auth-device-flow.md) for details on device flow in headless environments.
+### Step 2: `gh` CLI Auth (scoped user)
+
+After deployment, authenticate `gh` as a separate user for git operations:
+
+```bash
+kubectl exec -it deployment/openab-copilot-copilot -- gh auth login -p https -w
+```
+
+Follow the device flow in your browser, authorizing with the desired GitHub account (e.g. a bot user like `thepagent`).
+
+Verify:
+
+```bash
+kubectl exec deployment/openab-copilot-copilot -- gh auth status
+```
+
+The `gh` token is stored under `~/.config/gh/` on the PVC and persists across pod restarts.
+
+### Summary
+
+| Auth Layer | Purpose | Account | Method |
+|---|---|---|---|
+| `COPILOT_GITHUB_TOKEN` | Copilot subscription (models) | Subscription owner | Fine-grained PAT env var |
+| `gh auth` | Git operations (clone, push) | Bot / scoped user | Device flow (`gh auth login`) |
+
+> **Note**: Classic personal access tokens (`ghp_`) are **not supported** for Copilot. Use a fine-grained PAT (`github_pat_`) with the "Copilot Requests" permission.
 
 ## Helm Install
 
 ```bash
-helm install openab openab/openab \
+helm install openab-copilot openab/openab \
   --set agents.kiro.enabled=false \
+  --set agents.copilot.discord.enabled=true \
   --set agents.copilot.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.copilot.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
-  --set agents.copilot.image=ghcr.io/openabdev/openab-copilot:latest \
+  --set agents.copilot.image=ghcr.io/openabdev/openab-copilot \
   --set agents.copilot.command=copilot \
   --set 'agents.copilot.args={--acp,--stdio}' \
   --set agents.copilot.persistence.enabled=true \
-  --set agents.copilot.workingDir=/home/node
+  --set agents.copilot.workingDir=/home/node \
+  --set 'agents.copilot.env.COPILOT_GITHUB_TOKEN=github_pat_YOUR_TOKEN_HERE'
 ```
 
 ## Model Selection
@@ -87,6 +127,6 @@ Model selection is controlled by Copilot CLI itself (via `/model` in interactive
 ## Known Limitations
 
 - ⚠️ ACP support is in **public preview** — behavior may change
-- ⚠️ Headless auth with `GITHUB_TOKEN` env var has not been fully validated; device flow via `gh auth login` is the recommended path
+- Classic personal access tokens (`ghp_`) are not supported — use fine-grained PATs (`github_pat_`)
 - Copilot CLI requires an active Copilot subscription per user/org
 - For Copilot Business/Enterprise, an admin must enable Copilot CLI from the Policies page
