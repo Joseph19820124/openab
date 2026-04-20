@@ -52,7 +52,7 @@ Generate a [fine-grained personal access token](https://github.com/settings/pers
 - Expiration: as needed
 - **Account permissions → Copilot Requests: Read-only** (this is the only permission required)
 
-Inject it as an env var in your Helm chart:
+Inject it as an env var in your Helm chart (add the last line):
 
 ```bash
 helm install openab-copilot openab/openab \
@@ -65,10 +65,10 @@ helm install openab-copilot openab/openab \
   --set 'agents.copilot.args={--acp,--stdio}' \
   --set agents.copilot.persistence.enabled=true \
   --set agents.copilot.workingDir=/home/node \
-  --set 'agents.copilot.env.COPILOT_GITHUB_TOKEN=github_pat_YOUR_TOKEN_HERE'
+  --set 'agents.copilot.env.COPILOT_GITHUB_TOKEN=github_pat_YOUR_TOKEN_HERE'  # optional
 ```
 
-Copilot CLI reads `COPILOT_GITHUB_TOKEN` automatically — no interactive login needed.
+> **Note**: `COPILOT_GITHUB_TOKEN` is only required if you want to authenticate the Copilot subscription via a fine-grained PAT without running `copilot login`, or if you plan to use `gh auth login` with a different user for git operations. If you only have one GitHub account, you can skip this and use `copilot login` instead (see below).
 
 ### Step 2: `gh` CLI Auth (scoped user)
 
@@ -110,7 +110,7 @@ helm install openab-copilot openab/openab \
   --set 'agents.copilot.args={--acp,--stdio}' \
   --set agents.copilot.persistence.enabled=true \
   --set agents.copilot.workingDir=/home/node \
-  --set 'agents.copilot.env.COPILOT_GITHUB_TOKEN=github_pat_YOUR_TOKEN_HERE'
+  --set 'agents.copilot.env.COPILOT_GITHUB_TOKEN=github_pat_YOUR_TOKEN_HERE'  # optional, see Authentication
 ```
 
 ## Model Selection
