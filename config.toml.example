@@ -34,7 +34,7 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 [agent]
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]
-working_dir = "/home/agent"
+working_dir = "."  # or "/home/agent" on Linux, "C:\\agent" on Windows
 
 # [agent]
 # command = "claude"

@@ -24,7 +24,8 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 
 ## Features
 
-- **Multi-platform** — supports Discord and Slack, run one or both simultaneously
+- **Multi-platform adapter** — supports Discord and Slack, run one or both simultaneously
+- **Cross-platform host** — runs on Linux and Windows (using native process management)
 - **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI via config
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
