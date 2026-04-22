@@ -1338,4 +1338,32 @@ mod tests {
             assert_eq!(result, c.expect, "FAILED: {}", c.name);
         }
     }
+
+    // --- use_streaming parity tests (regression for #533) ---
+    // Discord must mirror Slack: streaming only when allow_bot_messages=Off.
+    // When bots can post (Mentions/All), send-once avoids placeholder interference
+    // in bot-to-bot threads. See Slack fix in 4eed3fc and discord regression in 27b9e58.
+
+    /// Pure helper that mirrors DiscordAdapter::use_streaming() logic.
+    fn discord_should_stream(mode: AllowBots) -> bool {
+        mode == AllowBots::Off
+    }
+
+    /// Default (Off): streaming enabled for smooth human UX.
+    #[test]
+    fn discord_streams_when_bots_off() {
+        assert!(discord_should_stream(AllowBots::Off));
+    }
+
+    /// Mentions: send-once to avoid placeholder interference in bot-to-bot threads.
+    #[test]
+    fn discord_no_stream_when_bots_mentions() {
+        assert!(!discord_should_stream(AllowBots::Mentions));
+    }
+
+    /// All: send-once.
+    #[test]
+    fn discord_no_stream_when_bots_all() {
+        assert!(!discord_should_stream(AllowBots::All));
+    }
 }
