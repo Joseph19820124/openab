@@ -224,6 +224,8 @@ The key insight: OAB's session pool and agent runtime are platform-agnostic. The
 
 This also lowers the barrier to entry: triggering an agent no longer requires setting up a chat platform bot. A simple `curl -X POST https://gateway/webhook/custom -d '{"text": "run daily security scan"}'` from a cron job is enough to start an agent session — no SDK, no bot token, no platform account needed.
 
+Scheduled triggers are supported natively via any external scheduler (K8s CronJob, EventBridge, GitHub Actions cron) — the gateway sees a regular HTTP POST with no knowledge of scheduling logic.
+
 ---
 
 ## 6. Architectural Differences from v1
