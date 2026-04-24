@@ -298,8 +298,122 @@ fn expand_env_vars(raw: &str) -> String {
 pub fn load_config(path: &Path) -> anyhow::Result<Config> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
-    let expanded = expand_env_vars(&raw);
+    parse_config(&raw, path.display().to_string().as_str())
+}
+
+pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fetch remote config from {url}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("remote config request to {url} returned HTTP {status}");
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read response body from {url}: {e}"))?;
+    const MAX_CONFIG_BYTES: usize = 1024 * 1024; // 1 MiB
+    if bytes.len() > MAX_CONFIG_BYTES {
+        anyhow::bail!(
+            "remote config from {url} exceeds 1 MiB limit ({} bytes)",
+            bytes.len()
+        );
+    }
+    let raw = String::from_utf8(bytes.to_vec())
+        .map_err(|e| anyhow::anyhow!("remote config from {url} is not valid UTF-8: {e}"))?;
+    parse_config(&raw, url)
+}
+
+fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
+    let expanded = expand_env_vars(raw);
     let config: Config = toml::from_str(&expanded)
-        .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const MINIMAL_TOML: &str = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+"#;
+
+    #[test]
+    fn parse_minimal_config() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert_eq!(cfg.discord.unwrap().bot_token, "test-token");
+        assert_eq!(cfg.agent.command, "echo");
+        assert_eq!(cfg.pool.max_sessions, 10);
+        assert!(cfg.reactions.enabled);
+    }
+
+    #[test]
+    fn expand_env_vars_replaces_known_var() {
+        std::env::set_var("AB_TEST_VAR", "hello");
+        let result = expand_env_vars("token=${AB_TEST_VAR}");
+        assert_eq!(result, "token=hello");
+        std::env::remove_var("AB_TEST_VAR");
+    }
+
+    #[test]
+    fn expand_env_vars_unknown_becomes_empty() {
+        let result = expand_env_vars("token=${AB_NONEXISTENT_12345}");
+        assert_eq!(result, "token=");
+    }
+
+    #[test]
+    fn expand_env_vars_in_config() {
+        std::env::set_var("AB_TEST_TOKEN", "secret-bot-token");
+        let toml = r#"
+[discord]
+bot_token = "${AB_TEST_TOKEN}"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.discord.unwrap().bot_token, "secret-bot-token");
+        std::env::remove_var("AB_TEST_TOKEN");
+    }
+
+    #[test]
+    fn parse_invalid_toml_returns_error() {
+        let result = parse_config("not valid toml {{{}}", "test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to parse config from test"));
+    }
+
+    #[test]
+    fn load_config_missing_file_returns_error() {
+        let result = load_config(Path::new("/tmp/agent-broker-nonexistent.toml"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to read"));
+    }
+
+    #[test]
+    fn load_config_from_file() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, "{}", MINIMAL_TOML).unwrap();
+        let cfg = load_config(tmp.path()).unwrap();
+        assert_eq!(cfg.discord.unwrap().bot_token, "test-token");
+    }
+
+    #[tokio::test]
+    async fn load_config_from_url_invalid_host() {
+        let result = load_config_from_url("https://invalid.test.example/config.toml").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to fetch remote config"));
+    }
 }

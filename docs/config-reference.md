@@ -4,6 +4,25 @@ OpenAB is configured via a TOML file (default: `config.toml`). Environment varia
 
 At least one adapter section (`[discord]` or `[slack]`) is required.
 
+## Loading Config
+
+Specify the config source with `--config` / `-c`:
+
+```bash
+# Local file (default: config.toml when omitted)
+openab run -c config.toml
+
+# Remote URL via HTTPS (recommended)
+openab run -c https://example.com/config.toml
+
+# Remote URL via HTTP (warns — avoid in production; config contains secrets)
+openab run -c http://internal.example.com/config.toml
+```
+
+Remote config is fetched via HTTP GET with a 10-second timeout and a 1 MiB response size limit. Environment variable expansion (`${VAR}`) works identically on both local and remote config content.
+
+> **Security best practice:** Never hardcode secrets in remote config files. Use environment variable references like `bot_token = "${DISCORD_BOT_TOKEN}"` and inject the actual values via local environment variables or Kubernetes Secrets. OpenAB expands `${VAR}` identically for both local and remote config.
+
 ---
 
 ## `[discord]`
