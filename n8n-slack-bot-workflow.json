@@ -1,0 +1,317 @@
+{
+  "name": "Slack Coding Agent Bot",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "slack-bot",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Slack Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 300],
+      "webhookId": "slack-bot"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "challenge-check",
+              "leftValue": "={{ $json.body.type }}",
+              "rightValue": "url_verification",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-challenge",
+      "name": "Is Challenge?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ challenge: $json.body.challenge }) }}",
+        "options": {}
+      },
+      "id": "respond-challenge",
+      "name": "Reply Challenge",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [660, 180]
+    },
+    {
+      "parameters": {
+        "respondWith": "noData",
+        "responseCode": 200,
+        "options": {}
+      },
+      "id": "respond-ok",
+      "name": "Reply 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [660, 420]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "bot-check",
+              "leftValue": "={{ $json.body.event?.bot_id }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "exists" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-bot",
+      "name": "Is Bot?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [880, 420]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/conversations.replies",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $credentials.slackBotToken }}" }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "channel", "value": "={{ $('Slack Webhook').item.json.body.event.channel }}" },
+            { "name": "ts", "value": "={{ $('Slack Webhook').item.json.body.event.thread_ts || $('Slack Webhook').item.json.body.event.ts }}" },
+            { "name": "limit", "value": "20" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "get-thread",
+      "name": "Get Thread History",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, 500],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SLACK_CREDENTIAL_ID",
+          "name": "Slack Bot Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Claude messages from Slack thread history\nconst webhook = $('Slack Webhook').first().json;\nconst event = webhook.body.event;\nconst threadResp = $input.first().json;\n\nconst botUserId = webhook.body.authorizations?.[0]?.user_id || 'BOT';\n\nlet messages = [];\n\nif (threadResp.ok && threadResp.messages) {\n  for (const msg of threadResp.messages) {\n    // Strip @mention of our bot from text\n    let text = (msg.text || '').replace(new RegExp(`<@${botUserId}>`, 'g'), '').trim();\n    if (!text) continue;\n    \n    if (msg.bot_id || msg.user === botUserId) {\n      messages.push({ role: 'assistant', content: text });\n    } else {\n      messages.push({ role: 'user', content: text });\n    }\n  }\n} else {\n  // No thread history, just use the current message\n  let text = (event.text || '').replace(new RegExp(`<@${botUserId}>`, 'g'), '').trim();\n  messages.push({ role: 'user', content: text });\n}\n\n// Ensure messages start with user role\nif (messages.length > 0 && messages[0].role !== 'user') {\n  messages = messages.filter(m => m.role === 'user' || messages.indexOf(m) > 0);\n}\n\nreturn [{\n  json: {\n    messages,\n    channel: event.channel,\n    thread_ts: event.thread_ts || event.ts,\n    user: event.user\n  }\n}];"
+      },
+      "id": "build-messages",
+      "name": "Build Claude Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 500]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{ $credentials.anthropicApiKey }}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-sonnet-4-20250514\",\n  \"max_tokens\": 4096,\n  \"system\": \"You are a helpful coding assistant in a Slack workspace. You help with code reviews, debugging, writing code, explaining concepts, and software engineering tasks. Be concise but thorough. Use Slack markdown formatting (```code blocks```, *bold*, _italic_). When writing code, always specify the language in code blocks.\",\n  \"messages\": {{ JSON.stringify($json.messages) }},\n  \"tools\": [\n    {\n      \"name\": \"execute_javascript\",\n      \"description\": \"Execute a JavaScript code snippet and return the result. Use for calculations, data transformations, or generating code output.\",\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"code\": { \"type\": \"string\", \"description\": \"JavaScript code to execute\" }\n        },\n        \"required\": [\"code\"]\n      }\n    },\n    {\n      \"name\": \"search_web\",\n      \"description\": \"Search the web for programming documentation, API references, or technical information.\",\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"query\": { \"type\": \"string\", \"description\": \"Search query\" }\n        },\n        \"required\": [\"query\"]\n      }\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "claude-api",
+      "name": "Claude API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1540, 500],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ANTHROPIC_CREDENTIAL_ID",
+          "name": "Anthropic API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "tool-use-check",
+              "leftValue": "={{ $json.stop_reason }}",
+              "rightValue": "tool_use",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-tool-use",
+      "name": "Tool Use?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1760, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Execute tool calls from Claude\nconst response = $input.first().json;\nconst prevMessages = $('Build Claude Messages').first().json.messages;\nconst channel = $('Build Claude Messages').first().json.channel;\nconst thread_ts = $('Build Claude Messages').first().json.thread_ts;\n\nlet toolResults = [];\nlet assistantContent = response.content || [];\n\nfor (const block of assistantContent) {\n  if (block.type === 'tool_use') {\n    let result = '';\n    try {\n      if (block.name === 'execute_javascript') {\n        // Execute JS in a sandboxed way\n        const fn = new Function(block.input.code);\n        result = String(fn() ?? 'Code executed successfully (no return value)');\n      } else if (block.name === 'search_web') {\n        result = `[Web search not implemented in this version. Query: ${block.input.query}]`;\n      } else {\n        result = `Unknown tool: ${block.name}`;\n      }\n    } catch (e) {\n      result = `Error: ${e.message}`;\n    }\n    toolResults.push({\n      type: 'tool_result',\n      tool_use_id: block.id,\n      content: result.substring(0, 4000)\n    });\n  }\n}\n\n// Build messages for the follow-up Claude call\nconst newMessages = [\n  ...prevMessages,\n  { role: 'assistant', content: assistantContent },\n  { role: 'user', content: toolResults }\n];\n\nreturn [{ json: { messages: newMessages, channel, thread_ts } }];"
+      },
+      "id": "execute-tools",
+      "name": "Execute Tools",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{ $credentials.anthropicApiKey }}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-sonnet-4-20250514\",\n  \"max_tokens\": 4096,\n  \"system\": \"You are a helpful coding assistant in a Slack workspace. You help with code reviews, debugging, writing code, explaining concepts, and software engineering tasks. Be concise but thorough. Use Slack markdown formatting.\",\n  \"messages\": {{ JSON.stringify($json.messages) }}\n}",
+        "options": {}
+      },
+      "id": "claude-api-followup",
+      "name": "Claude Follow-up",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2200, 380],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ANTHROPIC_CREDENTIAL_ID",
+          "name": "Anthropic API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract text response from Claude\nconst response = $input.first().json;\nconst content = response.content || [];\nconst channel = $('Build Claude Messages').first().json.channel;\nconst thread_ts = $('Build Claude Messages').first().json.thread_ts;\n\nlet text = '';\nfor (const block of content) {\n  if (block.type === 'text') {\n    text += block.text;\n  }\n}\n\nif (!text) text = '(No response generated)';\n\n// Slack has a 4000 char limit per message; split if needed\nconst maxLen = 3900;\nconst chunks = [];\nfor (let i = 0; i < text.length; i += maxLen) {\n  chunks.push(text.substring(i, i + maxLen));\n}\n\nreturn chunks.map(chunk => ({\n  json: { text: chunk, channel, thread_ts }\n}));"
+      },
+      "id": "format-response",
+      "name": "Format Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2420, 500]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $credentials.slackBotToken }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"channel\": \"{{ $json.channel }}\",\n  \"thread_ts\": \"{{ $json.thread_ts }}\",\n  \"text\": {{ JSON.stringify($json.text) }}\n}",
+        "options": {}
+      },
+      "id": "slack-reply",
+      "name": "Slack Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2640, 500],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SLACK_CREDENTIAL_ID",
+          "name": "Slack Bot Token"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Slack Webhook": {
+      "main": [
+        [{ "node": "Is Challenge?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Challenge?": {
+      "main": [
+        [{ "node": "Reply Challenge", "type": "main", "index": 0 }],
+        [{ "node": "Reply 200", "type": "main", "index": 0 },
+         { "node": "Is Bot?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Bot?": {
+      "main": [
+        [],
+        [{ "node": "Get Thread History", "type": "main", "index": 0 }]
+      ]
+    },
+    "Get Thread History": {
+      "main": [
+        [{ "node": "Build Claude Messages", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Claude Messages": {
+      "main": [
+        [{ "node": "Claude API", "type": "main", "index": 0 }]
+      ]
+    },
+    "Claude API": {
+      "main": [
+        [{ "node": "Tool Use?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Tool Use?": {
+      "main": [
+        [{ "node": "Execute Tools", "type": "main", "index": 0 }],
+        [{ "node": "Format Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Execute Tools": {
+      "main": [
+        [{ "node": "Claude Follow-up", "type": "main", "index": 0 }]
+      ]
+    },
+    "Claude Follow-up": {
+      "main": [
+        [{ "node": "Format Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Format Response": {
+      "main": [
+        [{ "node": "Slack Reply", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [{ "name": "slack-bot" }]
+}
