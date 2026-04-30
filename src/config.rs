@@ -257,13 +257,13 @@ fn default_cron_timezone() -> String { "UTC".into() }
 
 /// Controls how tool calls are rendered in chat messages.
 ///
-/// - `full`: show complete tool title including arguments (original behavior)
-/// - `compact`: show only a count summary, e.g. `✅ 3 · 🔧 1 tool(s)` (default)
+/// - `full`: show complete tool title including arguments (default, original behavior)
+/// - `compact`: show only a count summary, e.g. `✅ 3 · 🔧 1 tool(s)`
 /// - `none`: hide tool lines entirely, only show final response
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ToolDisplay {
-    Full,
     #[default]
+    Full,
     Compact,
     None,
 }
@@ -572,6 +572,11 @@ command = "echo"
         // resolve_allow_all: non-empty lists → restricted
         assert!(!resolve_allow_all(gw.allow_all_users, &gw.allowed_users));
         assert!(!resolve_allow_all(gw.allow_all_channels, &gw.allowed_channels));
+    }
+
+    #[test]
+    fn tool_display_default_is_full() {
+        assert_eq!(ToolDisplay::default(), ToolDisplay::Full);
     }
 
     #[test]
