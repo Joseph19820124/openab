@@ -35,6 +35,12 @@ impl DiscordAdapter {
     pub fn new(http: Arc<Http>) -> Self {
         Self { http }
     }
+
+    /// Resolve the effective Discord channel ID from a ChannelRef.
+    /// Discord threads are channels, so prefer thread_id when set.
+    fn resolve_channel(channel: &ChannelRef) -> &str {
+        channel.thread_id.as_deref().unwrap_or(&channel.channel_id)
+    }
 }
 
 #[async_trait]
@@ -48,7 +54,7 @@ impl ChatAdapter for DiscordAdapter {
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> anyhow::Result<MessageRef> {
-        let ch_id: u64 = channel.channel_id.parse()?;
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         let msg = ChannelId::new(ch_id).say(&self.http, content).await?;
         Ok(MessageRef {
             channel: channel.clone(),
@@ -57,7 +63,7 @@ impl ChatAdapter for DiscordAdapter {
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> anyhow::Result<()> {
-        let ch_id: u64 = msg.channel.channel_id.parse()?;
+        let ch_id: u64 = Self::resolve_channel(&msg.channel).parse()?;
         let msg_id: u64 = msg.message_id.parse()?;
         ChannelId::new(ch_id)
             .edit_message(
@@ -93,11 +99,12 @@ impl ChatAdapter for DiscordAdapter {
             channel_id: thread.id.to_string(),
             thread_id: None,
             parent_id: Some(channel.channel_id.clone()),
+            origin_event_id: None,
         })
     }
 
     async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> anyhow::Result<()> {
-        let ch_id: u64 = msg.channel.channel_id.parse()?;
+        let ch_id: u64 = Self::resolve_channel(&msg.channel).parse()?;
         let msg_id: u64 = msg.message_id.parse()?;
         self.http
             .create_reaction(
@@ -110,7 +117,7 @@ impl ChatAdapter for DiscordAdapter {
     }
 
     async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> anyhow::Result<()> {
-        let ch_id: u64 = msg.channel.channel_id.parse()?;
+        let ch_id: u64 = Self::resolve_channel(&msg.channel).parse()?;
         let msg_id: u64 = msg.message_id.parse()?;
         self.http
             .delete_reaction_me(
@@ -285,19 +292,25 @@ impl EventHandler for Handler {
                         // Must match the full thread allowlist semantics: a thread is allowed
                         // if its own channel_id OR its parent_id is in allowed_channels.
                         let ch = msg.channel_id.get();
-                        let mut allowed_here = self.allow_all_channels
-                            || self.allowed_channels.contains(&ch);
+                        let in_allowed_channel = self.allowed_channels.contains(&ch);
+                        let mut allowed_here = self.allow_all_channels || in_allowed_channel;
                         if !allowed_here {
-                            // Thread channel_id won't be in allowed_channels directly —
-                            // check parent_id via to_channel(). Only called on the
-                            // WarnAndStop path (once per soft/hard limit hit), not on
-                            // every bot message.
+                            // Reuse detect_thread() for thread allowlist semantics.
+                            // Only called on the WarnAndStop path (once per soft/hard
+                            // limit hit), not on every bot message.
                             if let Ok(serenity::model::channel::Channel::Guild(gc)) =
                                 msg.channel_id.to_channel(&ctx.http).await
                             {
-                                if gc.parent_id.is_some_and(|pid| {
-                                    self.allowed_channels.contains(&pid.get())
-                                }) {
+                                let (in_thread, _) = detect_thread(
+                                    gc.thread_metadata.is_some(),
+                                    gc.parent_id.map(|id| id.get()),
+                                    gc.owner_id.map(|id| id.get()),
+                                    bot_id.get(),
+                                    &self.allowed_channels,
+                                    self.allow_all_channels,
+                                    in_allowed_channel,
+                                );
+                                if in_thread {
                                     allowed_here = true;
                                 }
                             }
@@ -384,8 +397,9 @@ impl EventHandler for Handler {
         // Thread detection: single to_channel() call for both allowed and
         // non-allowed channels. Uses thread_metadata (not parent_id) to
         // identify threads — see detect_thread() doc comments for rationale.
-        let (in_thread, bot_owns_thread) = match msg.channel_id.to_channel(&ctx.http).await {
+        let (in_thread, bot_owns_thread, thread_parent_id) = match msg.channel_id.to_channel(&ctx.http).await {
             Ok(serenity::model::channel::Channel::Guild(gc)) => {
+                let parent = gc.parent_id.map(|id| id.get().to_string());
                 let result = detect_thread(
                     gc.thread_metadata.is_some(),
                     gc.parent_id.map(|id| id.get()),
@@ -404,15 +418,15 @@ impl EventHandler for Handler {
                     bot_owns = ?result.1,
                     "thread check"
                 );
-                (result.0, result.1.unwrap_or(false))
+                (result.0, result.1.unwrap_or(false), if result.0 { parent } else { None })
             }
             Ok(other) => {
                 tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild thread");
-                (false, false)
+                (false, false, None)
             }
             Err(e) => {
                 tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
-                (false, false)
+                (false, false, None)
             }
         };
 
@@ -470,7 +484,7 @@ impl EventHandler for Handler {
             }
         }
 
-        if !self.allow_all_users && !self.allowed_users.contains(&msg.author.id.get()) {
+        if is_denied_user(msg.author.bot, self.allow_all_users, &self.allowed_users, msg.author.id.get()) {
             tracing::info!(user_id = %msg.author.id, "denied user, ignoring");
             let msg_ref = discord_msg_ref(&msg);
             let _ = adapter.add_reaction(&msg_ref, "🚫").await;
@@ -489,16 +503,14 @@ impl EventHandler for Handler {
             .as_ref()
             .and_then(|m| m.nick.as_ref())
             .unwrap_or(&msg.author.name);
-        let sender = SenderContext {
-            schema: "openab.sender.v1".into(),
-            sender_id: msg.author.id.to_string(),
-            sender_name: msg.author.name.clone(),
-            display_name: display_name.to_string(),
-            channel: "discord".into(),
-            channel_id: msg.channel_id.to_string(),
-            thread_id: None,
-            is_bot: msg.author.bot,
-        };
+        let sender = build_sender_context(
+            &msg.author.id.to_string(),
+            &msg.author.name,
+            display_name,
+            &msg.channel_id.to_string(),
+            thread_parent_id.as_deref(),
+            msg.author.bot,
+        );
 
         // Build extra content blocks from attachments (audio → STT, text → inline, image → encode)
         let mut extra_blocks = Vec::new();
@@ -576,7 +588,8 @@ impl EventHandler for Handler {
                 platform: "discord".into(),
                 channel_id: msg.channel_id.get().to_string(),
                 thread_id: None,
-                parent_id: None,
+                parent_id: thread_parent_id.clone(),
+                origin_event_id: None,
             }
         } else {
             match get_or_create_thread(&ctx, &adapter, &msg, &prompt).await {
@@ -812,6 +825,7 @@ fn discord_msg_ref(msg: &Message) -> MessageRef {
             channel_id: msg.channel_id.get().to_string(),
             thread_id: None,
             parent_id: None,
+            origin_event_id: None,
         },
         message_id: msg.id.to_string(),
     }
@@ -832,6 +846,7 @@ async fn get_or_create_thread(
                 channel_id: msg.channel_id.get().to_string(),
                 thread_id: None,
                 parent_id: None,
+                origin_event_id: None,
             });
         }
     }
@@ -842,6 +857,7 @@ async fn get_or_create_thread(
         channel_id: msg.channel_id.get().to_string(),
         thread_id: None,
         parent_id: None,
+        origin_event_id: None,
     };
     let trigger_ref = discord_msg_ref(msg);
     match adapter.create_thread(&parent, &trigger_ref, &thread_name).await {
@@ -872,6 +888,7 @@ async fn get_or_create_thread(
                 channel_id: existing.id.to_string(),
                 thread_id: None,
                 parent_id: Some(msg.channel_id.get().to_string()),
+                origin_event_id: None,
             })
         }
         Err(e) => Err(e),
@@ -905,7 +922,39 @@ fn resolve_mentions(content: &str, bot_id: UserId) -> String {
     out.trim().to_string()
 }
 
-/// Whether the Discord adapter should use streaming edit.
+/// Build a `SenderContext` for Discord messages.
+///
+/// Pure function extracted from `EventHandler::message` for testability.
+/// When `thread_parent_id` is `Some`, the message is inside a thread:
+/// - `channel_id` → parent channel (where the thread lives)
+/// - `thread_id`  → thread's own channel ID
+///
+/// This mirrors Slack's model where `channel_id` is always the parent
+/// channel and `thread_id` (thread_ts) identifies the thread.
+///
+/// Note: `ChannelRef.channel_id` uses the *opposite* convention — it holds
+/// the thread's channel ID for routing (Discord API sends to thread by its
+/// channel ID). See `ChannelRef` doc comments for details.
+fn build_sender_context(
+    sender_id: &str,
+    sender_name: &str,
+    display_name: &str,
+    msg_channel_id: &str,
+    thread_parent_id: Option<&str>,
+    is_bot: bool,
+) -> SenderContext {
+    SenderContext {
+        schema: "openab.sender.v1".into(),
+        sender_id: sender_id.to_string(),
+        sender_name: sender_name.to_string(),
+        display_name: display_name.to_string(),
+        channel: "discord".into(),
+        channel_id: thread_parent_id.unwrap_or(msg_channel_id).to_string(),
+        thread_id: thread_parent_id.map(|_| msg_channel_id.to_string()),
+        is_bot,
+    }
+}
+
 /// Pure thread detection: determines whether a channel is a Discord thread
 /// in an allowed parent, and whether the bot owns it.
 ///
@@ -941,6 +990,12 @@ fn detect_thread(
         || parent_id.is_some_and(|pid| allowed_channels.contains(&pid));
     let bot_owns = owner_id.is_some_and(|oid| oid == bot_id);
     (in_allowed_thread, Some(bot_owns))
+}
+
+/// Returns `true` if the author should be denied by the user allowlist.
+/// Bot authors skip this check — they are gated by `allow_bot_messages` + `trusted_bot_ids`.
+fn is_denied_user(is_bot: bool, allow_all_users: bool, allowed_users: &HashSet<u64>, user_id: u64) -> bool {
+    !is_bot && !allow_all_users && !allowed_users.contains(&user_id)
 }
 
 /// Pure decision function: should this message be processed or ignored?
@@ -1193,6 +1248,38 @@ mod tests {
         assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
     }
 
+    // --- build_sender_context tests (regression for #581 → #584) ---
+    // PR #583 fixed SenderContext to use parent channel_id when in a thread.
+    // These tests verify the pure function extracted from EventHandler::message.
+
+    /// In-thread message: channel_id = parent, thread_id = thread channel ID.
+    #[test]
+    fn build_sender_context_in_thread() {
+        let ctx = build_sender_context("user1", "alice", "Alice", "thread_ch", Some("parent_ch"), false);
+        assert_eq!(ctx.channel_id, "parent_ch");
+        assert_eq!(ctx.thread_id, Some("thread_ch".to_string()));
+        assert_eq!(ctx.channel, "discord");
+        assert_eq!(ctx.sender_id, "user1");
+        assert!(!ctx.is_bot);
+    }
+
+    /// Non-thread message: channel_id = message channel, thread_id = None.
+    #[test]
+    fn build_sender_context_not_in_thread() {
+        let ctx = build_sender_context("user1", "alice", "Alice", "main_ch", None, false);
+        assert_eq!(ctx.channel_id, "main_ch");
+        assert_eq!(ctx.thread_id, None);
+    }
+
+    /// Bot sender: is_bot flag propagated correctly.
+    #[test]
+    fn build_sender_context_bot_sender() {
+        let ctx = build_sender_context("bot1", "mybot", "MyBot", "ch", Some("parent"), true);
+        assert!(ctx.is_bot);
+        assert_eq!(ctx.channel_id, "parent");
+        assert_eq!(ctx.thread_id, Some("ch".to_string()));
+    }
+
     // --- detect_thread tests (regression for #506 → #518 → #519) ---
     // PR #506 used parent_id.is_some() to detect threads, but category text
     // channels also have parent_id (pointing to the category). This caused
@@ -1345,6 +1432,19 @@ mod tests {
         }
     }
 
+    // --- WarnAndStop regression test (#633) ---
+    // The WarnAndStop path now delegates to detect_thread(). This test pins
+    // the exact scenario from #633: a category child channel whose category
+    // ID is in another bot's allowed_channels must NOT be treated as allowed.
+    #[test]
+    fn detect_thread_rejects_category_child_in_warn_and_stop() {
+        let category_id: u64 = 200;
+        let allowed = HashSet::from([category_id]);
+        // Category child: has parent_id (the category) but NO thread_metadata.
+        let (in_thread, _) = detect_thread(false, Some(category_id), None, 1000, &allowed, false, false);
+        assert!(!in_thread, "category child must not match allowed_channels via parent_id");
+    }
+
     // --- Per-thread streaming tests (#534) ---
     // Streaming ON by default, OFF when another bot is detected in the thread.
 
@@ -1360,5 +1460,54 @@ mod tests {
     fn discord_no_stream_when_other_bot_present() {
         let adapter = super::DiscordAdapter::new(Arc::new(super::Http::new("")));
         assert!(!adapter.use_streaming(true));
+    }
+
+    // --- resolve_channel tests ---
+
+    #[test]
+    fn resolve_channel_uses_channel_id_when_no_thread() {
+        let ch = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "111".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        assert_eq!(DiscordAdapter::resolve_channel(&ch), "111");
+    }
+
+    #[test]
+    fn resolve_channel_prefers_thread_id_when_set() {
+        let ch = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "111".into(),
+            thread_id: Some("222".into()),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        assert_eq!(DiscordAdapter::resolve_channel(&ch), "222");
+    }
+
+    // --- is_denied_user tests (regression for #604) ---
+
+    /// Human not in allowlist → denied.
+    #[test]
+    fn denied_user_human_not_in_allowlist() {
+        let allowed = HashSet::from([100]);
+        assert!(is_denied_user(false, false, &allowed, 999));
+    }
+
+    /// Human in allowlist → allowed.
+    #[test]
+    fn denied_user_human_in_allowlist() {
+        let allowed = HashSet::from([100]);
+        assert!(!is_denied_user(false, false, &allowed, 100));
+    }
+
+    /// Bot not in allowlist → allowed (bots skip user gate). This is the #604 fix.
+    #[test]
+    fn denied_user_bot_skips_allowlist() {
+        let allowed = HashSet::from([100]);
+        assert!(!is_denied_user(true, false, &allowed, 999));
     }
 }

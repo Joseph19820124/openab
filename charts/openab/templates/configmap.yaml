@@ -114,6 +114,43 @@ data:
     model = {{ ($cfg.stt).model | default "whisper-large-v3-turbo" | toJson }}
     base_url = {{ ($cfg.stt).baseUrl | default "https://api.groq.com/openai/v1" | toJson }}
     {{- end }}
+    {{- if ($cfg.gateway).enabled }}
+    {{- if not ($cfg.gateway).url }}
+    {{ fail (printf "agents.%s.gateway.url is required when gateway.enabled=true" $name) }}
+    {{- end }}
+
+    [gateway]
+    url = {{ ($cfg.gateway).url | toJson }}
+    platform = {{ ($cfg.gateway).platform | default "telegram" | toJson }}
+    {{- if ($cfg.gateway).token }}
+    token = "${GATEWAY_WS_TOKEN}"
+    {{- end }}
+    {{- if ($cfg.gateway).botUsername }}
+    bot_username = {{ ($cfg.gateway).botUsername | toJson }}
+    {{- end }}
+    {{- end }}
+    {{- if or ($cfg.cronjobs) (($cfg.cron).usercronEnabled) (($cfg.cron).usercronPath) }}
+
+    [cron]
+    usercron_enabled = {{ (($cfg.cron).usercronEnabled) | default false }}
+    {{- if (($cfg.cron).usercronPath) }}
+    usercron_path = {{ ($cfg.cron).usercronPath | toJson }}
+    {{- end }}
+    {{- range ($cfg.cronjobs) }}
+
+    [[cron.jobs]]
+    enabled = {{ .enabled | default true }}
+    schedule = {{ .schedule | toJson }}
+    channel = {{ .channel | toJson }}
+    message = {{ .message | toJson }}
+    platform = {{ .platform | default "discord" | toJson }}
+    sender_name = {{ .senderName | default "openab-cron" | toJson }}
+    timezone = {{ .timezone | default "UTC" | toJson }}
+    {{- if .threadId }}
+    thread_id = {{ .threadId | toJson }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
   {{- if $cfg.agentsMd }}
   AGENTS.md: |
     {{- $cfg.agentsMd | nindent 4 }}

@@ -8,12 +8,21 @@ use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
 use crate::config::ReactionsConfig;
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
+use crate::markdown::{self, TableMode};
 use crate::reactions::StatusReactionController;
 
 // --- Platform-agnostic types ---
 
 /// Identifies a channel or thread across platforms.
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+///
+/// Used for **routing**: `channel_id` is the ID the adapter sends messages to.
+/// For Discord threads, this is the thread's own channel ID (Discord API
+/// requires it for `say`/`edit`). Use `parent_id` to find the parent channel.
+///
+/// Compare with `SenderContext`, which is **metadata for the agent**: there
+/// `channel_id` is the parent channel and `thread_id` is the thread,
+/// matching Slack's model for cross-platform consistency.
+#[derive(Clone, Debug)]
 pub struct ChannelRef {
     pub platform: String,
     pub channel_id: String,
@@ -22,6 +31,31 @@ pub struct ChannelRef {
     pub thread_id: Option<String>,
     /// Parent channel if this is a thread-as-channel (Discord).
     pub parent_id: Option<String>,
+    /// Originating gateway event ID, propagated back in `GatewayReply.reply_to`
+    /// so the gateway can correlate replies with inbound events (e.g. LINE reply tokens).
+    /// Excluded from Hash/Eq — two ChannelRefs pointing to the same channel are
+    /// equal regardless of which event they originated from.
+    pub origin_event_id: Option<String>,
+}
+
+impl PartialEq for ChannelRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.platform == other.platform
+            && self.channel_id == other.channel_id
+            && self.thread_id == other.thread_id
+            && self.parent_id == other.parent_id
+    }
+}
+
+impl Eq for ChannelRef {}
+
+impl std::hash::Hash for ChannelRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.platform.hash(state);
+        self.channel_id.hash(state);
+        self.thread_id.hash(state);
+        self.parent_id.hash(state);
+    }
 }
 
 /// Identifies a message across platforms.
@@ -32,6 +66,14 @@ pub struct MessageRef {
 }
 
 /// Sender identity injected into prompts for downstream agent context.
+///
+/// This is **metadata for the agent** — `channel_id` always refers to the
+/// logical parent channel, and `thread_id` identifies the thread (if any).
+/// This convention is consistent across platforms (Slack, Discord, Telegram).
+///
+/// Compare with `ChannelRef`, which is used for **routing**: there
+/// `channel_id` is the ID the adapter sends messages to (for Discord
+/// threads, that's the thread's own channel ID, not the parent).
 #[derive(Clone, Debug, Serialize)]
 pub struct SenderContext {
     pub schema: String,
@@ -41,7 +83,7 @@ pub struct SenderContext {
     pub channel: String,
     pub channel_id: String,
     /// Thread identifier, if the message is inside a thread.
-    /// Slack: thread_ts. Discord: None (threads are separate channels).
+    /// Slack: thread_ts. Discord: thread channel ID (channel_id holds the parent).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub is_bot: bool,
@@ -97,13 +139,15 @@ pub trait ChatAdapter: Send + Sync + 'static {
 pub struct AdapterRouter {
     pool: Arc<SessionPool>,
     reactions_config: ReactionsConfig,
+    table_mode: TableMode,
 }
 
 impl AdapterRouter {
-    pub fn new(pool: Arc<SessionPool>, reactions_config: ReactionsConfig) -> Self {
+    pub fn new(pool: Arc<SessionPool>, reactions_config: ReactionsConfig, table_mode: TableMode) -> Self {
         Self {
             pool,
             reactions_config,
+            table_mode,
         }
     }
 
@@ -229,6 +273,7 @@ impl AdapterRouter {
         let thread_channel = thread_channel.clone();
         let message_limit = adapter.message_limit();
         let streaming = adapter.use_streaming(other_bot_present);
+        let table_mode = self.table_mode;
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -380,6 +425,7 @@ impl AdapterRouter {
                         final_content
                     };
 
+                    let final_content = markdown::convert_tables(&final_content, table_mode);
                     let chunks = format::split_message(&final_content, message_limit);
                     if let Some(msg) = placeholder_msg {
                         // Streaming: edit first chunk into placeholder, send rest as new messages
@@ -518,5 +564,67 @@ mod tests {
         let adapter = TestAdapter;
         // Verify the method is callable and returns the declared value
         assert!(!adapter.use_streaming(false));
+    }
+
+    #[test]
+    fn origin_event_id_excluded_from_eq() {
+        let a = ChannelRef {
+            platform: "line".into(),
+            channel_id: "U123".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_aaa".into()),
+        };
+        let b = ChannelRef {
+            platform: "line".into(),
+            channel_id: "U123".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_bbb".into()),
+        };
+        assert_eq!(a, b, "same channel with different event IDs must be equal");
+    }
+
+    #[test]
+    fn origin_event_id_excluded_from_hash() {
+        use std::collections::HashMap;
+        let a = ChannelRef {
+            platform: "line".into(),
+            channel_id: "U123".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_aaa".into()),
+        };
+        let b = ChannelRef {
+            platform: "line".into(),
+            channel_id: "U123".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_bbb".into()),
+        };
+        let mut map = HashMap::new();
+        map.insert(a, "first");
+        // b should hit the same bucket and overwrite
+        map.insert(b, "second");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.values().next(), Some(&"second"));
+    }
+
+    #[test]
+    fn origin_event_id_survives_clone() {
+        let ch = ChannelRef {
+            platform: "line".into(),
+            channel_id: "U123".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_abc".into()),
+        };
+        // Simulates create_thread propagation: clone preserves origin_event_id
+        let thread_ch = ChannelRef {
+            thread_id: Some("topic_1".into()),
+            origin_event_id: ch.origin_event_id.clone(),
+            ..ch.clone()
+        };
+        assert_eq!(thread_ch.origin_event_id.as_deref(), Some("evt_abc"));
     }
 }

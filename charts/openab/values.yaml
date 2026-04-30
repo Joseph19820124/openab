@@ -169,6 +169,28 @@ agents:
       apiKey: ""
       model: "whisper-large-v3-turbo"
       baseUrl: "https://api.groq.com/openai/v1"
+    gateway:
+      enabled: false    # set to true + provide url to enable
+      url: ""           # e.g. ws://openab-gateway:8080/ws
+      platform: "telegram"  # default platform when gateway is enabled
+      token: ""         # optional shared secret (injected via GATEWAY_WS_TOKEN env var)
+      botUsername: ""   # optional, for @mention gating
+    # Scheduled messages — config-driven cron (ADR: basic-cronjob)
+    # Each entry sends a message to the agent at the specified schedule.
+    # Example:
+    #   cronjobs:
+    #     - schedule: "0 9 * * 1-5"
+    #       channel: "123456789"
+    #       message: "summarize yesterday's merged PRs"
+    #       enabled: true          # set to false to disable this job without removing it
+    #       platform: "discord"
+    #       senderName: "DailyOps"
+    #       timezone: "Asia/Taipei"
+    #       threadId: ""
+    cron:
+      usercronEnabled: false
+      usercronPath: ""
+    cronjobs: []
     persistence:
       enabled: true
       storageClass: ""

@@ -83,6 +83,11 @@ impl SlackAdapter {
         }
     }
 
+    /// Returns the bot token for use in API calls outside the adapter.
+    pub fn bot_token(&self) -> &str {
+        &self.bot_token
+    }
+
     /// Eagerly record that another bot has posted in a thread. Called from the
     /// event loop when a bot message arrives, so multibot detection doesn't
     /// depend on fetching thread history. Idempotent.
@@ -345,6 +350,7 @@ impl ChatAdapter for SlackAdapter {
                 channel_id: channel.channel_id.clone(),
                 thread_id: channel.thread_id.clone(),
                 parent_id: None,
+                origin_event_id: None,
             },
             message_id: ts.to_string(),
         })
@@ -363,6 +369,7 @@ impl ChatAdapter for SlackAdapter {
             channel_id: channel.channel_id.clone(),
             thread_id: Some(trigger_msg.message_id.clone()),
             parent_id: None,
+            origin_event_id: None,
         })
     }
 
@@ -474,7 +481,7 @@ const MAX_CONSECUTIVE_BOT_TURNS: usize = 10;
 /// Reconnects automatically on disconnect.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_slack_adapter(
-    bot_token: String,
+    adapter: Arc<SlackAdapter>,
     app_token: String,
     allow_all_channels: bool,
     allow_all_users: bool,
@@ -484,13 +491,12 @@ pub async fn run_slack_adapter(
     trusted_bot_ids: HashSet<String>,
     allow_user_messages: AllowUsers,
     max_bot_turns: u32,
-    session_ttl: std::time::Duration,
     stt_config: SttConfig,
     router: Arc<AdapterRouter>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let adapter = Arc::new(SlackAdapter::new(bot_token.clone(), session_ttl, allow_bot_messages));
     let queue = Arc::new(KeyedAsyncQueue::new());
+    let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
 
     loop {
@@ -688,6 +694,7 @@ pub async fn run_slack_adapter(
                                                                         channel_id: channel_id.to_string(),
                                                                         thread_id: event["thread_ts"].as_str().map(|s| s.to_string()),
                                                                         parent_id: None,
+                                                                        origin_event_id: None,
                                                                     };
                                                                     let _ = adapter.send_message(&warn_channel, &user_message).await;
                                                                 }
@@ -952,6 +959,7 @@ async fn handle_message(
                 channel_id: channel_id.clone(),
                 thread_id: thread_ts.clone(),
                 parent_id: None,
+                origin_event_id: None,
             },
             message_id: ts.clone(),
         };
@@ -1017,6 +1025,7 @@ async fn handle_message(
                             channel_id: channel_id.clone(),
                             thread_id: thread_ts.clone(),
                             parent_id: None,
+                            origin_event_id: None,
                         },
                         message_id: ts.clone(),
                     };
@@ -1092,6 +1101,7 @@ async fn handle_message(
             channel_id: channel_id.clone(),
             thread_id: thread_ts.clone(),
             parent_id: None,
+            origin_event_id: None,
         },
         message_id: ts.clone(),
     };
@@ -1102,6 +1112,7 @@ async fn handle_message(
         channel_id: channel_id.clone(),
         thread_id: Some(thread_ts.unwrap_or(ts)),
         parent_id: None,
+        origin_event_id: None,
     };
 
     // Serialize sender context with Slack-native key names so agents calling

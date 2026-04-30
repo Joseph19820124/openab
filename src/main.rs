@@ -2,9 +2,11 @@ mod acp;
 mod adapter;
 mod bot_turns;
 mod config;
+mod cron;
 mod discord;
 mod error_display;
 mod format;
+mod markdown;
 mod media;
 mod reactions;
 mod setup;
@@ -19,6 +21,33 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
+
+/// Wait for SIGINT (ctrl_c) or, on unix, SIGTERM. SIGTERM is what Kubernetes
+/// sends during pod termination, so handling it lets us run the full cleanup
+/// path (shard manager, ACP pool drain) instead of getting SIGKILL'd after the
+/// grace period.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to install SIGTERM handler, falling back to ctrl_c only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => { info!("SIGTERM received"); }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "openab")]
@@ -107,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
         info!(model = %cfg.stt.model, base_url = %cfg.stt.base_url, "STT enabled");
     }
 
-    let router = Arc::new(AdapterRouter::new(pool.clone(), cfg.reactions));
+    let router = Arc::new(AdapterRouter::new(pool.clone(), cfg.reactions, cfg.markdown.tables));
 
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -120,6 +149,22 @@ async fn main() -> anyhow::Result<()> {
             cleanup_pool.cleanup_idle(ttl_secs).await;
         }
     });
+
+    // Pre-build shared adapters for cron scheduler (avoids duplicate Http clients / rate-limit buckets)
+    let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = cfg.discord.as_ref().map(|dc| {
+        let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
+        Arc::new(discord::DiscordAdapter::new(http)) as Arc<dyn adapter::ChatAdapter>
+    });
+    let session_ttl_dur = std::time::Duration::from_secs(ttl_secs);
+    let shared_slack_adapter: Option<Arc<slack::SlackAdapter>> = cfg.slack.as_ref().map(|s| {
+        Arc::new(slack::SlackAdapter::new(s.bot_token.clone(), session_ttl_dur, s.allow_bot_messages))
+    });
+
+    // Validate cronjob config at startup (fail-fast on bad cron expressions or timezones)
+    let mut configured_platforms: Vec<&str> = Vec::new();
+    if cfg.discord.is_some() { configured_platforms.push("discord"); }
+    if cfg.slack.is_some() { configured_platforms.push("slack"); }
+    cron::validate_cronjobs(&cfg.cron.jobs, &configured_platforms)?;
 
     // Spawn Slack adapter (background task)
     let slack_handle = if let Some(slack_cfg) = cfg.slack {
@@ -139,12 +184,12 @@ async fn main() -> anyhow::Result<()> {
         );
         let router = router.clone();
         let stt = cfg.stt.clone();
-        let session_ttl = std::time::Duration::from_secs(ttl_secs);
         let max_bot_turns = slack_cfg.max_bot_turns;
         let slack_shutdown_rx = shutdown_rx.clone();
+        let adapter = shared_slack_adapter.clone().expect("shared_slack_adapter must exist when slack config is present");
         Some(tokio::spawn(async move {
             if let Err(e) = slack::run_slack_adapter(
-                slack_cfg.bot_token,
+                adapter,
                 slack_cfg.app_token,
                 allow_all_channels,
                 allow_all_users,
@@ -154,7 +199,6 @@ async fn main() -> anyhow::Result<()> {
                 slack_cfg.trusted_bot_ids.into_iter().collect(),
                 slack_cfg.allow_user_messages,
                 max_bot_turns,
-                session_ttl,
                 stt,
                 router,
                 slack_shutdown_rx,
@@ -177,6 +221,45 @@ async fn main() -> anyhow::Result<()> {
             if let Err(e) = gateway::run_gateway_adapter(gw_cfg.url, gw_cfg.platform, gw_cfg.token, gw_cfg.bot_username, router, shutdown_rx).await {
                 error!("gateway adapter error: {e}");
             }
+        }))
+    } else {
+        None
+    };
+
+    // Spawn cron scheduler (background task) — reuses shared adapters
+    let usercron_path = if cfg.cron.usercron_enabled {
+        cfg.cron.usercron_path.as_ref().map(|p| {
+            let path = std::path::PathBuf::from(p);
+            if path.is_absolute() {
+                path
+            } else {
+                // Relative paths resolve from $HOME (e.g. "cronjob.toml" → "$HOME/cronjob.toml")
+                std::env::var("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default()
+                    .join(path)
+            }
+        })
+    } else {
+        None
+    };
+    let has_cron_work = !cfg.cron.jobs.is_empty() || usercron_path.is_some();
+    let cron_handle = if has_cron_work {
+        let shutdown_rx = shutdown_rx.clone();
+        let cronjobs = cfg.cron.jobs.clone();
+        let cron_router = router.clone();
+        let mut cron_adapters: std::collections::HashMap<String, Arc<dyn adapter::ChatAdapter>> =
+            std::collections::HashMap::new();
+        if let Some(ref a) = shared_discord_adapter {
+            cron_adapters.insert("discord".into(), a.clone());
+        }
+        if let Some(ref a) = shared_slack_adapter {
+            cron_adapters.insert("slack".into(), a.clone() as Arc<dyn adapter::ChatAdapter>);
+        }
+        let cron_platforms: Vec<String> = configured_platforms.iter().map(|s| s.to_string()).collect();
+        info!(baseline = cronjobs.len(), usercron = ?usercron_path, "starting cron scheduler");
+        Some(tokio::spawn(async move {
+            cron::run_scheduler(cronjobs, usercron_path, cron_platforms, cron_router, cron_adapters, shutdown_rx).await;
         }))
     } else {
         None
@@ -233,7 +316,7 @@ async fn main() -> anyhow::Result<()> {
         // Graceful Discord shutdown on ctrl_c
         let shard_manager = client.shard_manager.clone();
         tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
+            shutdown_signal().await;
             info!("shutdown signal received");
             shard_manager.shutdown_all().await;
         });
@@ -241,9 +324,9 @@ async fn main() -> anyhow::Result<()> {
         info!("discord bot running");
         client.start().await?;
     } else {
-        // No Discord — just wait for ctrl_c
+        // No Discord — wait for SIGINT or SIGTERM
         info!("running without discord, press ctrl+c to stop");
-        tokio::signal::ctrl_c().await.ok();
+        shutdown_signal().await;
         info!("shutdown signal received");
     }
 
@@ -256,6 +339,10 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(handle) = gateway_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+    if let Some(handle) = cron_handle {
+        // cron.rs drains in-flight tasks for up to 30s, so wait slightly longer
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(35), handle).await;
     }
     let shutdown_pool = pool;
     shutdown_pool.shutdown().await;

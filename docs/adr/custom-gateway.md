@@ -148,6 +148,9 @@ Key fields in the base schema:
 }
 ```
 
+Key fields in the outbound reply:
+- **`reply_to`**: the `event_id` of the inbound `GatewayEvent` that triggered this reply. The gateway can use this for reply correlation — e.g., looking up a cached LINE reply token to prefer the free Reply API over the quota-consuming Push API. Empty string if the reply is not associated with a specific inbound event (e.g., cron-triggered messages).
+
 ### Design Principles for the Schema
 
 - **Platform field is metadata, not routing logic** — OAB uses it for session key construction and sender context, but does not branch behavior on it

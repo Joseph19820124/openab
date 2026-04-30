@@ -1,3 +1,4 @@
+use crate::markdown::TableMode;
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -43,6 +44,22 @@ pub struct Config {
     pub reactions: ReactionsConfig,
     #[serde(default)]
     pub stt: SttConfig,
+    #[serde(default)]
+    pub markdown: MarkdownConfig,
+    #[serde(default)]
+    pub cron: CronConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CronConfig {
+    /// Enable usercron hot-reload (default: false). Must be explicitly set to true.
+    #[serde(default)]
+    pub usercron_enabled: bool,
+    /// Path to an external cronjob.toml for hot-reloadable user-managed schedules.
+    pub usercron_path: Option<String>,
+    /// Baseline cronjob definitions: `[[cron.jobs]]`
+    #[serde(default)]
+    pub jobs: Vec<CronJobConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -196,6 +213,34 @@ pub struct PoolConfig {
     pub session_ttl_hours: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct CronJobConfig {
+    /// Whether this cronjob is active (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Cron expression (5-field POSIX format)
+    pub schedule: String,
+    /// Target channel ID
+    pub channel: String,
+    /// Message to send to the agent
+    pub message: String,
+    /// Target platform (default: "discord")
+    #[serde(default = "default_cron_platform")]
+    pub platform: String,
+    /// Sender name for attribution (default: "openab-cron")
+    #[serde(default = "default_cron_sender")]
+    pub sender_name: String,
+    /// Optional thread ID (post to existing thread)
+    pub thread_id: Option<String>,
+    /// Timezone (default: "UTC")
+    #[serde(default = "default_cron_timezone")]
+    pub timezone: String,
+}
+
+fn default_cron_platform() -> String { "discord".into() }
+fn default_cron_sender() -> String { "openab-cron".into() }
+fn default_cron_timezone() -> String { "UTC".into() }
+
 #[derive(Debug, Deserialize)]
 pub struct ReactionsConfig {
     #[serde(default = "default_true")]
@@ -295,6 +340,14 @@ impl Default for ReactionTiming {
             error_hold_ms: default_error_hold_ms(),
         }
     }
+}
+
+// --- markdown ---
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MarkdownConfig {
+    #[serde(default)]
+    pub tables: TableMode,
 }
 
 // --- loading ---

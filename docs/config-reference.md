@@ -185,6 +185,75 @@ Speech-to-text transcription for voice messages. Uses an OpenAI-compatible `/aud
 
 ---
 
+## `[cron]`
+
+Everything cron-related lives under `[cron]`.
+
+```toml
+[cron]
+usercron_enabled = true                      # enable hot-reload (default: false)
+usercron_path = "cronjob.toml"               # relative to $HOME, or absolute
+
+[[cron.jobs]]
+enabled = true                               # optional, default: true
+schedule = "0 9 * * 1-5"                    # cron expression (5-field POSIX)
+channel = "123456789"                        # target channel/thread ID
+message = "summarize yesterday's merged PRs" # message sent to agent
+platform = "discord"                         # optional, default: "discord"
+sender_name = "DailyOps"                     # optional, default: "openab-cron"
+timezone = "America/New_York"                # optional, default: "UTC"
+thread_id = ""                               # optional, post to existing thread
+
+[[cron.jobs]]
+schedule = "0 0 * * 0"
+channel = "123456789"
+message = "generate weekly status report"
+platform = "discord"
+timezone = "UTC"
+```
+
+### `[cron]` fields
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `usercron_enabled` | bool | `false` | Enable usercron hot-reload. Must be explicitly set to `true`. |
+| `usercron_path` | string | — | Path to the external `cronjob.toml`. Relative paths resolve from `$HOME`. |
+
+### `[[cron.jobs]]` fields
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | Set `false` to disable without removing the entry. |
+| `schedule` | string | *required* | Cron expression (minute, hour, day-of-month, month, day-of-week). |
+| `channel` | string | *required* | Target Discord channel/thread ID or Slack channel ID. |
+| `message` | string | *required* | Message sent to the agent as a prompt. |
+| `platform` | string | `"discord"` | Target platform (`"discord"` or `"slack"`). |
+| `sender_name` | string | `"openab-cron"` | Sender attribution shown in the prompt context. |
+| `timezone` | string | `"UTC"` | IANA timezone for schedule evaluation (e.g. `"America/New_York"`, `"Europe/Berlin"`). |
+| `thread_id` | string | `""` | Optional thread ID to post into an existing thread. |
+
+The external `cronjob.toml` uses `[[jobs]]` (same fields). See [Usercron docs](cronjob.md#usercron--hot-reload-with-cronjobtoml) for details.
+
+**Cron expression format:**
+
+```
+┌───────────── minute (0-59)
+│ ┌───────────── hour (0-23)
+│ │ ┌───────────── day of month (1-31)
+│ │ │ ┌───────────── month (1-12)
+│ │ │ │ ┌───────────── day of week (0-7, 0 and 7 = Sunday)
+│ │ │ │ │
+* * * * *
+```
+
+**Behaviors:**
+- Scheduler evaluates expressions once per minute
+- If a previous execution is still running, the next tick is skipped (no overlap)
+- Failed executions are logged but do not block other jobs or chat traffic
+- Stateless — no persistence needed, re-evaluated from config on restart
+
+---
+
 ## Customizing via Helm
 
 When deploying with the Helm chart (`charts/openab`), the `config.toml` is generated from `values.yaml`. Each agent is defined under the `agents` map:
@@ -222,6 +291,14 @@ Key mapping (`values.yaml` → `config.toml`):
 | `agents.<name>.pool.sessionTtlHours` | `[pool] session_ttl_hours` |
 | `agents.<name>.reactions.enabled` | `[reactions] enabled` |
 | `agents.<name>.stt.apiKey` | `[stt] api_key` |
+| `agents.<name>.cronjobs[].enabled` | `[[cron.jobs]] enabled` |
+| `agents.<name>.cronjobs[].schedule` | `[[cron.jobs]] schedule` |
+| `agents.<name>.cronjobs[].channel` | `[[cron.jobs]] channel` |
+| `agents.<name>.cronjobs[].message` | `[[cron.jobs]] message` |
+| `agents.<name>.cronjobs[].platform` | `[[cron.jobs]] platform` |
+| `agents.<name>.cronjobs[].senderName` | `[[cron.jobs]] sender_name` |
+| `agents.<name>.cronjobs[].timezone` | `[[cron.jobs]] timezone` |
+| `agents.<name>.cronjobs[].threadId` | `[[cron.jobs]] thread_id` |
 
 > ⚠️ Use `--set-string` (not `--set`) for Discord/Slack IDs to avoid float64 precision loss:
 > ```bash

@@ -15,7 +15,6 @@ use tracing::{error, info, warn};
 struct GatewayEvent {
     #[allow(dead_code)]
     schema: String,
-    #[allow(dead_code)]
     event_id: String,
     #[allow(dead_code)]
     timestamp: String,
@@ -139,7 +138,7 @@ impl ChatAdapter for GatewayAdapter {
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
-            reply_to: String::new(),
+            reply_to: channel.origin_event_id.clone().unwrap_or_default(),
             platform: channel.platform.clone(),
             channel: ReplyChannel {
                 id: channel.channel_id.clone(),
@@ -196,6 +195,7 @@ impl ChatAdapter for GatewayAdapter {
                 channel_id: channel.channel_id.clone(),
                 thread_id: resp.thread_id,
                 parent_id: None,
+                origin_event_id: channel.origin_event_id.clone(),
             }),
             Ok(Ok(resp)) => {
                 warn!(err = ?resp.error, "create_topic failed, falling back to same channel");
@@ -364,6 +364,7 @@ pub async fn run_gateway_adapter(
                                         channel_id: event.channel.id.clone(),
                                         thread_id: event.channel.thread_id.clone(),
                                         parent_id: None,
+                                        origin_event_id: Some(event.event_id.clone()),
                                     };
 
                                     let sender_ctx = SenderContext {
