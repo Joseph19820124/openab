@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use std::sync::LazyLock;
 use serenity::builder::{CreateActionRow, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage};
 use serenity::http::Http;
-use serenity::model::application::{ComponentInteractionDataKind, Interaction};
+use serenity::model::application::{Command, ComponentInteractionDataKind, Interaction};
 use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
@@ -638,26 +638,35 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, "discord bot connected");
 
-        // Register /model slash command to all guilds the bot is in
+        // Build the shared command list once.
+        let commands = vec![
+            CreateCommand::new("models")
+                .description("Select the AI model for this session"),
+            CreateCommand::new("agents")
+                .description("Select the agent mode for this session"),
+            CreateCommand::new("cancel")
+                .description("Cancel the current operation"),
+            CreateCommand::new("reset")
+                .description("Reset the conversation session"),
+        ];
+
+        // Register global commands (works in DMs + all guilds after propagation).
+        if let Err(e) = Command::set_global_commands(&ctx.http, commands.clone()).await {
+            tracing::warn!(error = %e, "failed to register global slash commands");
+        } else {
+            info!("registered global slash commands");
+        }
+
+        // Also register per-guild for instant availability (global can take up to 1h).
         for guild in &ready.guilds {
             let guild_id = guild.id;
             if let Err(e) = guild_id
-                .set_commands(
-                    &ctx.http,
-                    vec![
-                        CreateCommand::new("models")
-                            .description("Select the AI model for this session"),
-                        CreateCommand::new("agents")
-                            .description("Select the agent mode for this session"),
-                        CreateCommand::new("cancel")
-                            .description("Cancel the current operation"),
-                    ],
-                )
+                .set_commands(&ctx.http, commands.clone())
                 .await
             {
-                tracing::warn!(%guild_id, error = %e, "failed to register slash commands");
+                tracing::warn!(%guild_id, error = %e, "failed to register guild slash commands");
             } else {
-                info!(%guild_id, "registered slash commands");
+                info!(%guild_id, "registered guild slash commands");
             }
         }
     }
@@ -673,6 +682,9 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "cancel" => {
                 self.handle_cancel_command(&ctx, &cmd).await;
             }
+            Interaction::Command(cmd) if cmd.data.name == "reset" => {
+                self.handle_reset_command(&ctx, &cmd).await;
+            }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
             }
@@ -686,10 +698,20 @@ impl EventHandler for Handler {
 
 impl Handler {
     /// Build a Discord select menu from ACP configOptions with the given category.
+    /// Discord limits Select Menus to 25 options; excess options are truncated.
+    /// The currently selected option is always included (placed first if needed).
     fn build_config_select(options: &[ConfigOption], category: &str) -> Option<CreateSelectMenu> {
         let opt = options.iter().find(|o| o.category.as_deref() == Some(category))?;
-        let menu_options: Vec<CreateSelectMenuOption> = opt
-            .options
+
+        // Ensure current selection is in the first 25 by placing it first,
+        // then filling remaining slots with the rest in original order.
+        let sorted: Vec<_> = opt.options.iter()
+            .filter(|o| o.value == opt.current_value)
+            .chain(opt.options.iter().filter(|o| o.value != opt.current_value))
+            .take(25)
+            .collect();
+
+        let menu_options: Vec<CreateSelectMenuOption> = sorted
             .iter()
             .map(|o| {
                 let mut item = CreateSelectMenuOption::new(&o.name, &o.value);
@@ -707,15 +729,22 @@ impl Handler {
             return None;
         }
 
+        let truncated = opt.options.len() > 25;
+        let placeholder = format!(
+            "Current: {}{}",
+            opt.options.iter()
+                .find(|o| o.value == opt.current_value)
+                .map(|o| o.name.as_str())
+                .unwrap_or(&opt.current_value),
+            if truncated { format!(" ({} more not shown)", opt.options.len() - 25) } else { String::new() },
+        );
+
         Some(
             CreateSelectMenu::new(
                 format!("acp_config_{}", opt.id),
                 CreateSelectMenuKind::String { options: menu_options },
             )
-            .placeholder(format!("Current: {}", opt.options.iter()
-                .find(|o| o.value == opt.current_value)
-                .map(|o| o.name.as_str())
-                .unwrap_or(&opt.current_value)))
+            .placeholder(placeholder)
         )
     }
 
@@ -767,6 +796,27 @@ impl Handler {
         );
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /cancel command");
+        }
+    }
+
+    async fn handle_reset_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        let thread_key = format!("discord:{}", cmd.channel_id.get());
+        let result = self.router.pool().reset_session(&thread_key).await;
+
+        let msg = match result {
+            Ok(()) => "🔄 Session reset. Start a new conversation!".to_string(),
+            Err(_) => "⚠️ No active session to reset. Start a conversation first by @mentioning the bot.".to_string(),
+        };
+
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content(msg).ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, "failed to respond to /reset command");
         }
     }
 
