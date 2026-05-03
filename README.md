@@ -4,7 +4,7 @@
 
 ![OpenAB banner](images/banner.jpg)
 
-A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark**, and other webhook-based platforms are supported via the standalone [Custom Gateway](gateway/).
+A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI, Qwen Code, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark**, and other webhook-based platforms are supported via the standalone [Custom Gateway](gateway/).
 
 🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://discord.gg/DmbhfDZjQS)** 🎉
 
@@ -143,6 +143,7 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 | OpenCode | `opencode acp` | Native | [docs/opencode.md](docs/opencode.md) |
 | Copilot CLI ⚠️ | `copilot --acp --stdio` | Native | [docs/copilot.md](docs/copilot.md) |
 | Cursor | `cursor-agent acp` | Native | [docs/cursor.md](docs/cursor.md) |
+| Qwen Code | `qwen --acp` | Native | [docs/qwen.md](docs/qwen.md) |
 
 > 🔧 Running multiple agents? See [docs/multi-agent.md](docs/multi-agent.md)
 

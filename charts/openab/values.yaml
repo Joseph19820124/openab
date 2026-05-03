@@ -120,6 +120,32 @@ agents:
     #     storageClass: ""
     #     size: 1Gi
     #   image: "ghcr.io/openabdev/openab-cursor:latest"
+    # qwen:
+    #   command: qwen
+    #   args:
+    #     - --acp
+    #     - --yolo
+    #   discord:
+    #     enabled: true
+    #     allowedChannels:
+    #       - "YOUR_CHANNEL_ID"
+    #     allowedUsers: []
+    #   workingDir: /home/node
+    #   env: {}  # Auth via: kubectl exec -it <pod> -- qwen auth
+    #            # Or set QWEN_API_KEY: env: { QWEN_API_KEY: "YOUR_KEY" }
+    #   envFrom: []
+    #   pool:
+    #     maxSessions: 10
+    #     sessionTtlHours: 24
+    #   reactions:
+    #     enabled: true
+    #     removeAfterReply: false
+    #   persistence:
+    #     enabled: true
+    #     existingClaim: ""
+    #     storageClass: ""
+    #     size: 1Gi
+    #   image: "ghcr.io/openabdev/openab-qwen:latest"
     image: ""
     command: kiro-cli
     args:

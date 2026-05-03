@@ -42,6 +42,12 @@ Agents deployed:
 {{- else if eq (toString $cfg.command) "cursor-agent" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- cursor-agent login
+{{- else if eq (toString $cfg.command) "qwen" }}
+    Authenticate (Qwen OAuth — recommended):
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- qwen auth
+    Or set QWEN_API_KEY via helm upgrade:
+    helm upgrade {{ .Release.Name }} openab/openab --reuse-values \
+      --set 'agents.{{ $name }}.env.QWEN_API_KEY=YOUR_API_KEY'
 {{- end }}
 
     Restart after auth:

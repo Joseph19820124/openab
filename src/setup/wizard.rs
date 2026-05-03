@@ -388,12 +388,13 @@ fn section_agent() -> (String, String, bool) {
         "kiro:    npm install -g @koryhutchison/kiro-cli",
         "codex:   npm install -g openai-codex (requires OpenAI API key)",
         "gemini:  npm install -g @google/gemini-cli",
+        "qwen:    npm install -g @qwen-code/qwen-code",
         "",
         "Make sure the agent is in your PATH before continuing.",
     ]);
     println!();
 
-    let choices = ["claude", "kiro", "codex", "gemini"];
+    let choices = ["claude", "kiro", "codex", "gemini", "qwen"];
     let idx = prompt_choice("  Select agent:", &choices);
     let agent = choices[idx];
 
@@ -538,6 +539,12 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
                 println!("       npm install -g @google/gemini-cli");
                 cprintln!(C.cyan, "  2. Authenticate via Google OAuth, or set GEMINI_API_KEY in config.toml");
             }
+            "qwen" => {
+                cprintln!(C.cyan, "  1. Install Qwen Code CLI:");
+                println!("       npm install -g @qwen-code/qwen-code");
+                cprintln!(C.cyan, "  2. Authenticate (Qwen OAuth — free tier):");
+                println!("       qwen auth");
+            }
             _ => {}
         }
 
@@ -567,6 +574,9 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
             ),
             "gemini" => println!(
                 "       Set GEMINI_API_KEY via secret, or exec into the pod for OAuth"
+            ),
+            "qwen" => println!(
+                "       kubectl exec -it deployment/openab-qwen -- qwen auth"
             ),
             _ => {}
         }

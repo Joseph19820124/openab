@@ -101,6 +101,16 @@ working_dir = "/home/agent"
 # working_dir = "/home/agent"
 # env = {}  # Auth via: kubectl exec -it <pod> -- cursor-agent login
 
+# [agent]
+# command = "qwen"
+# args = ["--acp", "--yolo"]
+# working_dir = "/home/node"
+# ⚠️ SECURITY WARNING: --yolo auto-approves all tool calls without confirmation.
+# Remove it to use the default approval mode (prompts for each tool call).
+# Qwen Code supports both Qwen OAuth (free tier) and API key auth.
+# env = { QWEN_API_KEY = "${QWEN_API_KEY}" }  # optional: set API key directly
+# # Auth via Qwen OAuth (recommended): kubectl exec -it <pod> -- qwen auth
+
 [pool]
 max_sessions = 10
 session_ttl_hours = 24
