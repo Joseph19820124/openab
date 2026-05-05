@@ -42,6 +42,10 @@ Agents deployed:
 {{- else if eq (toString $cfg.command) "cursor-agent" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- cursor-agent login
+{{- else if eq (toString $cfg.command) "qwen" }}
+    Authenticate (OpenRouter API key):
+    1. Mount ~/.qwen/settings.json via extraInitContainers (see docs/qwen.md)
+    2. Set OPENROUTER_API_KEY via secretEnv in Helm values
 {{- end }}
 
     Restart after auth:
