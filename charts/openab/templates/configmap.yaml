@@ -108,7 +108,7 @@ data:
     {{- end }}
     {{- $secretEnvKeys := list }}
     {{- range $cfg.secretEnv }}{{ $secretEnvKeys = append $secretEnvKeys .name }}{{ end }}
-    {{- $allInheritEnv := concat ($cfg.inheritEnv | default list) $secretEnvKeys }}
+    {{- $allInheritEnv := concat ($cfg.inheritEnv | default list) $secretEnvKeys | uniq }}
     {{- if $allInheritEnv }}
     inherit_env = {{ $allInheritEnv | toJson }}
     {{- end }}

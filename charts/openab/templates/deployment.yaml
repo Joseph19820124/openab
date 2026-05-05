@@ -84,6 +84,10 @@ spec:
               value: {{ $v | quote }}
             {{- end }}
             {{- range $cfg.secretEnv }}
+            {{- if hasKey ($cfg.env | default dict) .name }}{{ fail (printf "agents.%s: key '%s' appears in both env (plaintext) and secretEnv — remove it from env to prevent leaking the secret" $name .name) }}{{ end }}
+            {{- if not .name }}{{ fail (printf "agents.%s: a secretEnv entry is missing required field: name" $name) }}{{ end }}
+            {{- if not .secretName }}{{ fail (printf "agents.%s.secretEnv[%s]: missing required field: secretName" $name .name) }}{{ end }}
+            {{- if not .secretKey }}{{ fail (printf "agents.%s.secretEnv[%s]: missing required field: secretKey" $name .name) }}{{ end }}
             - name: {{ .name }}
               valueFrom:
                 secretKeyRef:

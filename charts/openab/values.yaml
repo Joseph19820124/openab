@@ -177,6 +177,18 @@ agents:
       # maxBotTurns: 20
     workingDir: /home/agent
     env: {}
+    # secretEnv: inject environment variables from Kubernetes Secrets, keeping
+    # secret values out of ConfigMaps. Each entry requires name, secretName,
+    # and secretKey. Names are also auto-merged into inherit_env in config.toml.
+    # Example:
+    #   secretEnv:
+    #     - name: ANTHROPIC_API_KEY
+    #       secretName: my-agent-secrets
+    #       secretKey: anthropic-api-key
+    #     - name: OPENAI_API_KEY
+    #       secretName: my-agent-secrets
+    #       secretKey: openai-api-key
+    secretEnv: []
     envFrom: []
     pool:
       maxSessions: 10
