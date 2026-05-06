@@ -321,6 +321,7 @@ async fn main() -> anyhow::Result<()> {
             max_bot_turns: discord_cfg.max_bot_turns,
             bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::new(discord_cfg.max_bot_turns)),
             allow_dm: discord_cfg.allow_dm,
+            scheduler_tx: scheduler_tx.clone(),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

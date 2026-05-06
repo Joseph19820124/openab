@@ -3,6 +3,7 @@ use crate::acp::protocol::ConfigOption;
 use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
+use crate::cron::CronCmd;
 use crate::format;
 use crate::media;
 use async_trait::async_trait;
@@ -160,6 +161,8 @@ pub struct Handler {
     pub bot_turns: tokio::sync::Mutex<BotTurnTracker>,
     /// Allow the bot to respond to Discord DMs.
     pub allow_dm: bool,
+    /// Dynamic cron control channel. Send CronCmd::AddJob / RemoveJob to manage jobs at runtime.
+    pub scheduler_tx: Arc<tokio::sync::mpsc::Sender<CronCmd>>,
 }
 
 impl Handler {
@@ -669,6 +672,38 @@ impl EventHandler for Handler {
                 .description("Cancel the current operation"),
             CreateCommand::new("reset")
                 .description("Reset the conversation session"),
+            CreateCommand::new("cron")
+                .description("Manage dynamic cron jobs")
+                .add_option(
+                    serenity::builder::CreateCommandOption::new(
+                        serenity::model::application::CommandOptionType::SubCommand, "add",
+                        "Add or replace a cron job",
+                    )
+                    .add_sub_option(serenity::builder::CreateCommandOption::new(
+                        serenity::model::application::CommandOptionType::String, "id", "Unique job ID",
+                    ).required(true))
+                    .add_sub_option(serenity::builder::CreateCommandOption::new(
+                        serenity::model::application::CommandOptionType::String, "schedule",
+                        "5-field cron expression, e.g. \"0 9 * * 1-5\"",
+                    ).required(true))
+                    .add_sub_option(serenity::builder::CreateCommandOption::new(
+                        serenity::model::application::CommandOptionType::String, "message",
+                        "Message to send to the agent",
+                    ).required(true))
+                    .add_sub_option(serenity::builder::CreateCommandOption::new(
+                        serenity::model::application::CommandOptionType::String, "timezone",
+                        "Timezone, e.g. Asia/Taipei (default: UTC)",
+                    ).required(false))
+                )
+                .add_option(
+                    serenity::builder::CreateCommandOption::new(
+                        serenity::model::application::CommandOptionType::SubCommand, "remove",
+                        "Remove a cron job by ID",
+                    )
+                    .add_sub_option(serenity::builder::CreateCommandOption::new(
+                        serenity::model::application::CommandOptionType::String, "id", "Job ID to remove",
+                    ).required(true))
+                ),
         ];
 
         // Register global commands (works in DMs + all guilds after propagation).
@@ -705,6 +740,9 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "reset" => {
                 self.handle_reset_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "cron" => {
+                self.handle_cron_command(&ctx, &cmd).await;
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
@@ -883,6 +921,87 @@ impl Handler {
         );
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /reset command");
+        }
+    }
+
+    async fn handle_cron_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        use crate::config::CronJobConfig;
+        use serenity::model::application::CommandDataOptionValue;
+
+        let sub = match cmd.data.options.first() {
+            Some(s) => s,
+            None => {
+                self.cron_reply(ctx, cmd, "⚠️ Usage: `/cron add` or `/cron remove`").await;
+                return;
+            }
+        };
+
+        let msg = match sub.name.as_str() {
+            "add" => {
+                let opts = match &sub.value {
+                    CommandDataOptionValue::SubCommand(o) => o,
+                    _ => { self.cron_reply(ctx, cmd, "⚠️ Invalid subcommand").await; return; }
+                };
+                let get = |name: &str| opts.iter().find(|o| o.name == name)
+                    .and_then(|o| if let CommandDataOptionValue::String(s) = &o.value { Some(s.as_str()) } else { None });
+
+                let id = match get("id") { Some(v) => v.to_string(), None => { self.cron_reply(ctx, cmd, "⚠️ Missing id").await; return; } };
+                let schedule = match get("schedule") { Some(v) => v.to_string(), None => { self.cron_reply(ctx, cmd, "⚠️ Missing schedule").await; return; } };
+                let message = match get("message") { Some(v) => v.to_string(), None => { self.cron_reply(ctx, cmd, "⚠️ Missing message").await; return; } };
+                let timezone = get("timezone").unwrap_or("UTC").to_string();
+
+                let config = CronJobConfig {
+                    enabled: true,
+                    schedule: schedule.clone(),
+                    channel: cmd.channel_id.get().to_string(),
+                    message,
+                    platform: "discord".to_string(),
+                    sender_name: "openab-cron".to_string(),
+                    thread_id: None,
+                    timezone: timezone.clone(),
+                };
+                match self.scheduler_tx.send(CronCmd::AddJob { id: id.clone(), config }).await {
+                    Ok(()) => format!("✅ Cron job `{id}` added: `{schedule}` ({timezone})"),
+                    Err(e) => format!("⚠️ Failed to add cron job: {e}"),
+                }
+            }
+            "remove" => {
+                let opts = match &sub.value {
+                    CommandDataOptionValue::SubCommand(o) => o,
+                    _ => { self.cron_reply(ctx, cmd, "⚠️ Invalid subcommand").await; return; }
+                };
+                let id = match opts.iter().find(|o| o.name == "id")
+                    .and_then(|o| if let CommandDataOptionValue::String(s) = &o.value { Some(s.as_str()) } else { None })
+                {
+                    Some(v) => v.to_string(),
+                    None => { self.cron_reply(ctx, cmd, "⚠️ Missing id").await; return; }
+                };
+                match self.scheduler_tx.send(CronCmd::RemoveJob { id: id.clone() }).await {
+                    Ok(()) => format!("🗑️ Cron job `{id}` removed (if it existed)"),
+                    Err(e) => format!("⚠️ Failed to remove cron job: {e}"),
+                }
+            }
+            other => format!("⚠️ Unknown subcommand: `{other}`"),
+        };
+
+        self.cron_reply(ctx, cmd, &msg).await;
+    }
+
+    async fn cron_reply(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+        msg: &str,
+    ) {
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content(msg).ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, "failed to respond to /cron command");
         }
     }
 
