@@ -257,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
     let has_cron_work = !cfg.cron.jobs.is_empty() || usercron_path.is_some();
+    let (scheduler_tx, scheduler_rx) = tokio::sync::mpsc::channel::<cron::CronCmd>(64);
     let cron_handle = if has_cron_work {
         let shutdown_rx = shutdown_rx.clone();
         let cronjobs = cfg.cron.jobs.clone();
@@ -272,11 +273,14 @@ async fn main() -> anyhow::Result<()> {
         let cron_platforms: Vec<String> = configured_platforms.iter().map(|s| s.to_string()).collect();
         info!(baseline = cronjobs.len(), usercron = ?usercron_path, "starting cron scheduler");
         Some(tokio::spawn(async move {
-            cron::run_scheduler(cronjobs, usercron_path, cron_platforms, cron_router, cron_adapters, shutdown_rx).await;
+            cron::run_scheduler(cronjobs, usercron_path, cron_platforms, cron_router, cron_adapters, shutdown_rx, scheduler_rx).await;
         }))
     } else {
+        drop(scheduler_rx);
         None
     };
+    // scheduler_tx can be cloned and passed to Discord/Slack command handlers for dynamic job management.
+    let _scheduler_tx = scheduler_tx;
 
     // Run Discord adapter (foreground, blocking) or wait for ctrl_c
     if let Some(discord_cfg) = cfg.discord {

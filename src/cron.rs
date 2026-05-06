@@ -156,6 +156,15 @@ fn parse_job_list(configs: &[CronJobConfig], source: &str) -> Vec<ParsedJob> {
 
 /// Run the internal cron scheduler. Evaluates cron expressions once per minute.
 /// `usercron_path` enables hot-reload of an external cronjob.toml file.
+/// Commands for dynamic hot-reload of cron jobs at runtime.
+#[derive(Debug)]
+pub enum CronCmd {
+    /// Add or replace a job identified by `id`.
+    AddJob { id: String, config: CronJobConfig },
+    /// Remove a job by `id`.
+    RemoveJob { id: String },
+}
+
 pub async fn run_scheduler(
     cronjobs: Vec<CronJobConfig>,
     usercron_path: Option<PathBuf>,
@@ -163,6 +172,7 @@ pub async fn run_scheduler(
     router: Arc<AdapterRouter>,
     adapters: HashMap<String, Arc<dyn ChatAdapter>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<CronCmd>,
 ) {
     let platform_refs: Vec<&str> = configured_platforms.iter().map(|s| s.as_str()).collect();
 
@@ -180,6 +190,9 @@ pub async fn run_scheduler(
         vec![]
     };
     let mut last_usercron_mtime: Option<SystemTime> = usercron_path.as_deref().and_then(file_mtime);
+
+    // Dynamic jobs added at runtime via CronCmd channel (keyed by user-supplied id).
+    let mut dynamic_jobs: std::collections::HashMap<String, ParsedJob> = std::collections::HashMap::new();
 
     if baseline_jobs.is_empty() && usercron_jobs.is_empty() {
         if usercron_path.is_some() {
@@ -233,7 +246,7 @@ pub async fn run_scheduler(
                     }
                 }
 
-                // Evaluate all jobs: baseline first, then usercron
+                // Evaluate all jobs: baseline first, then usercron, then dynamic
                 let all_jobs = baseline_jobs.iter().chain(usercron_jobs.iter());
                 for (idx, job) in all_jobs.enumerate() {
                     if !should_fire(&job.schedule, job.tz) {
@@ -265,8 +278,55 @@ pub async fn run_scheduler(
                     });
                 }
                 while tasks.try_join_next().is_some() {}
+
+                // Fire dynamic jobs (keyed by string id, use a stable hash of the id as idx offset)
+                for (id, job) in &dynamic_jobs {
+                    if !should_fire(&job.schedule, job.tz) { continue; }
+                    // Use a large offset to avoid colliding with static job indices
+                    let idx = usize::MAX / 2 + (id.len() * 7 + id.bytes().fold(0usize, |a, b| a.wrapping_add(b as usize)));
+                    {
+                        let running = in_flight.lock().await;
+                        if running.contains(&idx) {
+                            warn!(id, schedule = %job.config.schedule, \"skipping dynamic cronjob, still running\");
+                            continue;
+                        }
+                    }
+                    info!(id, schedule = %job.config.schedule, channel = %job.config.channel, \"🔔 dynamic cronjob fired\");
+                    in_flight.lock().await.insert(idx);
+                    let config = job.config.clone();
+                    let router = router.clone();
+                    let adapters = adapters.clone();
+                    let in_flight = in_flight.clone();
+                    tasks.spawn(async move {
+                        fire_cronjob(idx, &config, &router, &adapters, in_flight).await;
+                    });
+                }
+                while tasks.try_join_next().is_some() {}
             }
-            _ = shutdown_rx.changed() => {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(CronCmd::AddJob { id, config }) => {
+                        match (parse_cron_expr(&config.schedule), config.timezone.parse::<Tz>()) {
+                            (Ok(schedule), Ok(tz)) => {
+                                info!(id, schedule = %config.schedule, channel = %config.channel, \"dynamic cronjob added\");
+                                dynamic_jobs.insert(id, ParsedJob { schedule, tz, config });
+                            }
+                            (Err(e), _) => warn!(id, error = %e, \"AddJob: invalid cron expression, ignored\"),
+                            (_, Err(e)) => warn!(id, error = %e, \"AddJob: invalid timezone, ignored\"),
+                        }
+                    }
+                    Some(CronCmd::RemoveJob { id }) => {
+                        if dynamic_jobs.remove(&id).is_some() {
+                            info!(id, \"dynamic cronjob removed\");
+                        } else {
+                            warn!(id, \"RemoveJob: id not found\");
+                        }
+                    }
+                    None => {
+                        debug!(\"cron cmd channel closed\");
+                    }
+                }
+            }
                 if *shutdown_rx.borrow() {
                     info!("cron scheduler shutting down, waiting for in-flight tasks");
                     let drain = async { while tasks.join_next().await.is_some() {} };
