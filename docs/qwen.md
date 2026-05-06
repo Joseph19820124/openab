@@ -81,6 +81,11 @@ helm install openab openab/openab \
 
 > **`--yolo`**: Required for headless/ACP operation — allows tool calls without interactive confirmation. Only use in isolated environments (containers, K8s pods). See [security note](#security-note) below.
 
+> **Secret rotation**: Environment variables injected via `secretEnv` are baked into the pod at startup. If you rotate `OPENROUTER_API_KEY`, restart the deployment to pick up the new value:
+> ```bash
+> kubectl rollout restart deployment/<your-openab-qwen-deployment>
+> ```
+
 ## Manual config.toml
 
 ```toml
