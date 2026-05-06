@@ -256,9 +256,9 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let has_cron_work = !cfg.cron.jobs.is_empty() || usercron_path.is_some();
+    // Always start the scheduler — dynamic jobs via scheduler_tx work even with no static config.
     let (scheduler_tx, scheduler_rx) = tokio::sync::mpsc::channel::<cron::CronCmd>(64);
-    let cron_handle = if has_cron_work {
+    let cron_handle = {
         let shutdown_rx = shutdown_rx.clone();
         let cronjobs = cfg.cron.jobs.clone();
         let cron_router = router.clone();
@@ -272,15 +272,14 @@ async fn main() -> anyhow::Result<()> {
         }
         let cron_platforms: Vec<String> = configured_platforms.iter().map(|s| s.to_string()).collect();
         info!(baseline = cronjobs.len(), usercron = ?usercron_path, "starting cron scheduler");
-        Some(tokio::spawn(async move {
+        tokio::spawn(async move {
             cron::run_scheduler(cronjobs, usercron_path, cron_platforms, cron_router, cron_adapters, shutdown_rx, scheduler_rx).await;
-        }))
-    } else {
-        drop(scheduler_rx);
-        None
+        })
     };
-    // scheduler_tx can be cloned and passed to Discord/Slack command handlers for dynamic job management.
-    let _scheduler_tx = scheduler_tx;
+    // scheduler_tx: Arc-wrap so it can be cheaply cloned into Discord/Slack command handlers.
+    // Keep it alive until end of main — dropping it closes the channel and shuts down dynamic cron.
+    let scheduler_tx = std::sync::Arc::new(scheduler_tx);
+    let _keep_scheduler_tx = scheduler_tx.clone();
 
     // Run Discord adapter (foreground, blocking) or wait for ctrl_c
     if let Some(discord_cfg) = cfg.discord {
@@ -378,10 +377,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = gateway_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
-    if let Some(handle) = cron_handle {
-        // cron.rs drains in-flight tasks for up to 30s, so wait slightly longer
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(35), handle).await;
-    }
+    // cron.rs drains in-flight tasks for up to 30s, so wait slightly longer
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(35), cron_handle).await;
     let shutdown_pool = pool;
     shutdown_pool.shutdown().await;
     info!("openab shut down");

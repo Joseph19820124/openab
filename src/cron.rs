@@ -221,6 +221,9 @@ pub async fn run_scheduler(
 
     let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
+    // cmd_rx: None means channel closed — disable that select branch to avoid busy loop
+    let mut cmd_rx_open = true;
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -230,12 +233,6 @@ pub async fn run_scheduler(
                     if current_mtime != last_usercron_mtime {
                         let configs = load_usercron_file(path, &platform_refs);
                         info!(count = configs.len(), path = %path.display(), "usercron file changed, reloading");
-                        // Clear in-flight tracking for usercron jobs (indices shift on reload).
-                        // Design note: if a still-running old usercron task's InFlightGuard
-                        // drops after this point, the remove is a no-op (index already cleared).
-                        // A new job at the same index *could* fire concurrently in this tick —
-                        // probability is negligible (reload + fire on same tick + same index)
-                        // and acceptable for a hot-reload feature.
                         {
                             let mut running = in_flight.lock().await;
                             let baseline_len = baseline_jobs.len();
@@ -246,12 +243,10 @@ pub async fn run_scheduler(
                     }
                 }
 
-                // Evaluate all jobs: baseline first, then usercron, then dynamic
+                // Fire static jobs (baseline + usercron)
                 let all_jobs = baseline_jobs.iter().chain(usercron_jobs.iter());
                 for (idx, job) in all_jobs.enumerate() {
-                    if !should_fire(&job.schedule, job.tz) {
-                        continue;
-                    }
+                    if !should_fire(&job.schedule, job.tz) { continue; }
                     {
                         let running = in_flight.lock().await;
                         if running.contains(&idx) {
@@ -268,7 +263,6 @@ pub async fn run_scheduler(
                         "🔔 cronjob fired"
                     );
                     in_flight.lock().await.insert(idx);
-
                     let config = job.config.clone();
                     let router = router.clone();
                     let adapters = adapters.clone();
@@ -277,21 +271,21 @@ pub async fn run_scheduler(
                         fire_cronjob(idx, &config, &router, &adapters, in_flight).await;
                     });
                 }
-                while tasks.try_join_next().is_some() {}
 
-                // Fire dynamic jobs (keyed by string id, use a stable hash of the id as idx offset)
+                // Fire dynamic jobs
                 for (id, job) in &dynamic_jobs {
                     if !should_fire(&job.schedule, job.tz) { continue; }
-                    // Use a large offset to avoid colliding with static job indices
-                    let idx = usize::MAX / 2 + (id.len() * 7 + id.bytes().fold(0usize, |a, b| a.wrapping_add(b as usize)));
+                    // Stable idx: large offset + simple hash to avoid colliding with static indices
+                    let idx = usize::MAX / 2
+                        + id.bytes().fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(b as usize));
                     {
                         let running = in_flight.lock().await;
                         if running.contains(&idx) {
-                            warn!(id, schedule = %job.config.schedule, \"skipping dynamic cronjob, still running\");
+                            warn!(id, schedule = %job.config.schedule, "skipping dynamic cronjob, still running");
                             continue;
                         }
                     }
-                    info!(id, schedule = %job.config.schedule, channel = %job.config.channel, \"🔔 dynamic cronjob fired\");
+                    info!(id, schedule = %job.config.schedule, channel = %job.config.channel, "🔔 dynamic cronjob fired");
                     in_flight.lock().await.insert(idx);
                     let config = job.config.clone();
                     let router = router.clone();
@@ -301,32 +295,45 @@ pub async fn run_scheduler(
                         fire_cronjob(idx, &config, &router, &adapters, in_flight).await;
                     });
                 }
+
                 while tasks.try_join_next().is_some() {}
             }
-            cmd = cmd_rx.recv() => {
+
+            cmd = cmd_rx.recv(), if cmd_rx_open => {
                 match cmd {
                     Some(CronCmd::AddJob { id, config }) => {
-                        match (parse_cron_expr(&config.schedule), config.timezone.parse::<Tz>()) {
-                            (Ok(schedule), Ok(tz)) => {
-                                info!(id, schedule = %config.schedule, channel = %config.channel, \"dynamic cronjob added\");
-                                dynamic_jobs.insert(id, ParsedJob { schedule, tz, config });
+                        // Validate platform before accepting
+                        if !VALID_PLATFORMS.contains(&config.platform.as_str()) {
+                            warn!(id, platform = %config.platform, "AddJob: unknown platform, ignored");
+                        } else if !configured_platforms.contains(&config.platform) {
+                            warn!(id, platform = %config.platform, "AddJob: platform not configured, ignored");
+                        } else {
+                            match (parse_cron_expr(&config.schedule), config.timezone.parse::<Tz>()) {
+                                (Ok(schedule), Ok(tz)) => {
+                                    info!(id, schedule = %config.schedule, channel = %config.channel, "dynamic cronjob added");
+                                    dynamic_jobs.insert(id, ParsedJob { schedule, tz, config });
+                                }
+                                (Err(e), _) => warn!(id, error = %e, "AddJob: invalid cron expression, ignored"),
+                                (_, Err(e)) => warn!(id, error = %e, "AddJob: invalid timezone, ignored"),
                             }
-                            (Err(e), _) => warn!(id, error = %e, \"AddJob: invalid cron expression, ignored\"),
-                            (_, Err(e)) => warn!(id, error = %e, \"AddJob: invalid timezone, ignored\"),
                         }
                     }
                     Some(CronCmd::RemoveJob { id }) => {
                         if dynamic_jobs.remove(&id).is_some() {
-                            info!(id, \"dynamic cronjob removed\");
+                            info!(id, "dynamic cronjob removed");
                         } else {
-                            warn!(id, \"RemoveJob: id not found\");
+                            warn!(id, "RemoveJob: id not found");
                         }
                     }
                     None => {
-                        debug!(\"cron cmd channel closed\");
+                        // Channel closed — disable this branch to avoid busy loop
+                        debug!("cron cmd channel closed, disabling dynamic cmd branch");
+                        cmd_rx_open = false;
                     }
                 }
             }
+
+            _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
                     info!("cron scheduler shutting down, waiting for in-flight tasks");
                     let drain = async { while tasks.join_next().await.is_some() {} };
@@ -337,6 +344,7 @@ pub async fn run_scheduler(
         }
     }
 }
+
 
 /// RAII guard that removes a job index from the in-flight set on drop.
 struct InFlightGuard {
