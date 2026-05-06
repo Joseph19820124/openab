@@ -276,10 +276,8 @@ async fn main() -> anyhow::Result<()> {
             cron::run_scheduler(cronjobs, usercron_path, cron_platforms, cron_router, cron_adapters, shutdown_rx, scheduler_rx).await;
         })
     };
-    // scheduler_tx: Arc-wrap so it can be cheaply cloned into Discord/Slack command handlers.
-    // Keep it alive until end of main — dropping it closes the channel and shuts down dynamic cron.
+    // Arc-wrap so it can be cheaply cloned into Discord/Slack command handlers.
     let scheduler_tx = std::sync::Arc::new(scheduler_tx);
-    let _keep_scheduler_tx = scheduler_tx.clone();
 
     // Run Discord adapter (foreground, blocking) or wait for ctrl_c
     if let Some(discord_cfg) = cfg.discord {

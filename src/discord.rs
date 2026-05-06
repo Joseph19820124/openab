@@ -3,7 +3,7 @@ use crate::acp::protocol::ConfigOption;
 use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
-use crate::cron::CronCmd;
+use crate::cron::{parse_cron_expr, CronCmd};
 use crate::format;
 use crate::media;
 use async_trait::async_trait;
@@ -953,6 +953,15 @@ impl Handler {
                 let schedule = match get("schedule") { Some(v) => v.to_string(), None => { self.cron_reply(ctx, cmd, "⚠️ Missing schedule").await; return; } };
                 let message = match get("message") { Some(v) => v.to_string(), None => { self.cron_reply(ctx, cmd, "⚠️ Missing message").await; return; } };
                 let timezone = get("timezone").unwrap_or("UTC").to_string();
+
+                if let Err(e) = parse_cron_expr(&schedule) {
+                    self.cron_reply(ctx, cmd, &format!("⚠️ Invalid cron expression `{schedule}`: {e}")).await;
+                    return;
+                }
+                if let Err(e) = timezone.parse::<chrono_tz::Tz>() {
+                    self.cron_reply(ctx, cmd, &format!("⚠️ Invalid timezone `{timezone}`: {e}")).await;
+                    return;
+                }
 
                 let config = CronJobConfig {
                     enabled: true,

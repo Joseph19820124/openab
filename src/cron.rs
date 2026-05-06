@@ -198,8 +198,7 @@ pub async fn run_scheduler(
         if usercron_path.is_some() {
             info!("no cronjobs yet, but usercron_path is set — scheduler will watch for cronjob.toml");
         } else {
-            debug!("no cronjobs configured, scheduler not started");
-            return;
+            debug!("no static cronjobs configured, scheduler running for dynamic jobs only");
         }
     }
 
@@ -207,6 +206,7 @@ pub async fn run_scheduler(
     info!(baseline = baseline_jobs.len(), usercron = usercron_jobs.len(), total, "cron scheduler started");
 
     let in_flight: Arc<Mutex<HashSet<usize>>> = Arc::new(Mutex::new(HashSet::new()));
+    let in_flight_dynamic: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // Align to next minute boundary
     let now = Utc::now();
@@ -275,24 +275,22 @@ pub async fn run_scheduler(
                 // Fire dynamic jobs
                 for (id, job) in &dynamic_jobs {
                     if !should_fire(&job.schedule, job.tz) { continue; }
-                    // Stable idx: large offset + simple hash to avoid colliding with static indices
-                    let idx = usize::MAX / 2
-                        + id.bytes().fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(b as usize));
                     {
-                        let running = in_flight.lock().await;
-                        if running.contains(&idx) {
+                        let running = in_flight_dynamic.lock().await;
+                        if running.contains(id) {
                             warn!(id, schedule = %job.config.schedule, "skipping dynamic cronjob, still running");
                             continue;
                         }
                     }
                     info!(id, schedule = %job.config.schedule, channel = %job.config.channel, "🔔 dynamic cronjob fired");
-                    in_flight.lock().await.insert(idx);
+                    in_flight_dynamic.lock().await.insert(id.clone());
+                    let id = id.clone();
                     let config = job.config.clone();
                     let router = router.clone();
                     let adapters = adapters.clone();
-                    let in_flight = in_flight.clone();
+                    let in_flight_dyn = in_flight_dynamic.clone();
                     tasks.spawn(async move {
-                        fire_cronjob(idx, &config, &router, &adapters, in_flight).await;
+                        fire_dynamic_cronjob(id, &config, &router, &adapters, in_flight_dyn).await;
                     });
                 }
 
@@ -362,6 +360,22 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// RAII guard for dynamic jobs: removes job id from the in-flight string set on drop.
+struct InFlightDynamicGuard {
+    id: String,
+    set: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for InFlightDynamicGuard {
+    fn drop(&mut self) {
+        let id = self.id.clone();
+        let set = self.set.clone();
+        tokio::spawn(async move {
+            set.lock().await.remove(&id);
+        });
+    }
+}
+
 async fn fire_cronjob(
     idx: usize,
     job: &CronJobConfig,
@@ -370,7 +384,25 @@ async fn fire_cronjob(
     in_flight: Arc<Mutex<HashSet<usize>>>,
 ) {
     let _guard = InFlightGuard { idx, set: in_flight };
+    execute_job(job, router, adapters).await;
+}
 
+async fn fire_dynamic_cronjob(
+    id: String,
+    job: &CronJobConfig,
+    router: &Arc<AdapterRouter>,
+    adapters: &HashMap<String, Arc<dyn ChatAdapter>>,
+    in_flight_dynamic: Arc<Mutex<HashSet<String>>>,
+) {
+    let _guard = InFlightDynamicGuard { id, set: in_flight_dynamic };
+    execute_job(job, router, adapters).await;
+}
+
+async fn execute_job(
+    job: &CronJobConfig,
+    router: &Arc<AdapterRouter>,
+    adapters: &HashMap<String, Arc<dyn ChatAdapter>>,
+) {
     let adapter = match adapters.get(&job.platform) {
         Some(a) => a.clone(),
         None => {
