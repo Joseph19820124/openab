@@ -1,6 +1,8 @@
 # GG Coder CLI
 
-GG Coder supports ACP via the `--rpc` flag (JSON-RPC mode for IDE integrations).
+GG Coder does not currently expose ACP directly. OpenAB's GG Coder image installs
+`ggcoder-acp`, a small wrapper that speaks ACP on stdio and translates requests
+to GG Coder's `--rpc` JSON-RPC mode.
 
 ## Docker Image
 
@@ -8,7 +10,8 @@ GG Coder supports ACP via the `--rpc` flag (JSON-RPC mode for IDE integrations).
 docker build -f Dockerfile.ggcoder -t openab-ggcoder:latest .
 ```
 
-The image installs `@kenkaiiii/ggcoder` globally via npm.
+The image installs `@kenkaiiii/ggcoder` globally via npm and copies the
+`ggcoder-acp` wrapper into `/usr/local/bin`.
 
 ## Helm Install
 
@@ -19,21 +22,21 @@ helm install openab openab/openab \
   --set agents.ggcoder.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.ggcoder.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
   --set agents.ggcoder.image=ghcr.io/joseph19820124/openab-ggcoder:latest \
-  --set agents.ggcoder.command=ggcoder \
-  --set agents.ggcoder.args='{--rpc}' \
+  --set agents.ggcoder.command=ggcoder-acp \
   --set agents.ggcoder.workingDir=/home/node
 ```
 
 > Set `agents.kiro.enabled=false` to disable the default Kiro agent.
 >
-> (Optional) Use `--set agents.ggcoder.args='{--provider,anthropic,--rpc}'` to specify a provider explicitly.
+> (Optional) Use `--set agents.ggcoder.args='{--provider,openai}'` to pass
+> GG Coder CLI options through the ACP wrapper.
 
 ## Manual config.toml
 
 ```toml
 [agent]
-command = "ggcoder"
-args = ["--rpc"]
+command = "ggcoder-acp"
+args = []
 working_dir = "/home/node"
 ```
 

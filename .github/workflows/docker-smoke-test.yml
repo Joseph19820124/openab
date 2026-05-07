@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'Dockerfile*'
+      - 'bin/**'
       - 'src/**'
       - 'Cargo.*'
 
@@ -17,7 +18,7 @@ jobs:
           - { dockerfile: Dockerfile.claude, suffix: "-claude", agent: "claude-agent-acp", agent_args: "" }
           - { dockerfile: Dockerfile.codex, suffix: "-codex", agent: "codex-acp", agent_args: "" }
           - { dockerfile: Dockerfile.gemini, suffix: "-gemini", agent: "gemini", agent_args: "--acp" }
-          - { dockerfile: Dockerfile.ggcoder, suffix: "-ggcoder", agent: "ggcoder", agent_args: "--rpc" }
+          - { dockerfile: Dockerfile.ggcoder, suffix: "-ggcoder", agent: "ggcoder-acp", agent_args: "" }
           - { dockerfile: Dockerfile.copilot, suffix: "-copilot", agent: "copilot", agent_args: "--acp" }
           - { dockerfile: Dockerfile.opencode, suffix: "-opencode", agent: "opencode", agent_args: "acp" }
           - { dockerfile: Dockerfile.cursor, suffix: "-cursor", agent: "cursor-agent", agent_args: "acp" }

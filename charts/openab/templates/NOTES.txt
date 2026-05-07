@@ -36,7 +36,7 @@ Agents deployed:
 {{- else if eq (toString $cfg.command) "gemini" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- gemini
-{{- else if eq (toString $cfg.command) "ggcoder" }}
+{{- else if eq (toString $cfg.command) "ggcoder-acp" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- ggcoder login
 {{- else if eq (toString $cfg.command) "opencode" }}

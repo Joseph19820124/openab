@@ -383,12 +383,13 @@ fn section_agent() -> (String, String, bool) {
         "kiro:    npm install -g @koryhutchison/kiro-cli",
         "codex:   npm install -g openai-codex (requires OpenAI API key)",
         "gemini:  npm install -g @google/gemini-cli",
+        "ggcoder: npm install -g @kenkaiiii/ggcoder + install ggcoder-acp",
         "",
         "Make sure the agent is in your PATH before continuing.",
     ]);
     println!();
 
-    let choices = ["claude", "kiro", "codex", "gemini"];
+    let choices = ["claude", "kiro", "codex", "gemini", "ggcoder"];
     let idx = prompt_choice("  Select agent:", &choices);
     let agent = choices[idx];
 
@@ -530,6 +531,13 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
                     "  2. Authenticate via Google OAuth, or set GEMINI_API_KEY in config.toml"
                 );
             }
+            "ggcoder" => {
+                cprintln!(C.cyan, "  1. Install GG Coder CLI and the ACP wrapper:");
+                println!("       npm install -g @kenkaiiii/ggcoder");
+                println!("       install -m 755 bin/ggcoder-acp.mjs /usr/local/bin/ggcoder-acp");
+                cprintln!(C.cyan, "  2. Authenticate:");
+                println!("       ggcoder login");
+            }
             _ => {}
         }
 
@@ -565,6 +573,9 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
             ),
             "gemini" => {
                 println!("       Set GEMINI_API_KEY via secret, or exec into the pod for OAuth")
+            }
+            "ggcoder" => {
+                println!("       kubectl exec -it deployment/openab-ggcoder -- ggcoder login")
             }
             _ => {}
         }

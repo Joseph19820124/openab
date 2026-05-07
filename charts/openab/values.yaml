@@ -110,9 +110,8 @@ agents:
     #   resources: {}
     #   image: "ghcr.io/openabdev/openab-opencode:latest"
     # ggcoder:
-    #   command: ggcoder
-    #   args:
-    #     - --rpc
+    #   command: ggcoder-acp
+    #   args: []
     #   discord:
     #     enabled: true
     #     allowedChannels:

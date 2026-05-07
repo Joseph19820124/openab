@@ -157,7 +157,7 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 | Claude Code | `claude-agent-acp` | [@agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) | [docs/claude-code.md](docs/claude-code.md) |
 | Codex | `codex-acp` | [@zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | [docs/codex.md](docs/codex.md) |
 | Gemini | `gemini --acp` | Native | [docs/gemini.md](docs/gemini.md) |
-| GG Coder | `ggcoder --rpc` | Native | [docs/ggcoder.md](docs/ggcoder.md) |
+| GG Coder | `ggcoder-acp` | OpenAB wrapper around `ggcoder --rpc` | [docs/ggcoder.md](docs/ggcoder.md) |
 | OpenCode | `opencode acp` | Native | [docs/opencode.md](docs/opencode.md) |
 | Copilot CLI ⚠️ | `copilot --acp --stdio` | Native | [docs/copilot.md](docs/copilot.md) |
 | Cursor | `cursor-agent acp` | Native | [docs/cursor.md](docs/cursor.md) |
