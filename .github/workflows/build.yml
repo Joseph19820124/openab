@@ -69,6 +69,7 @@ jobs:
           - { suffix: "-codex", dockerfile: "Dockerfile.codex", artifact: "codex" }
           - { suffix: "-claude", dockerfile: "Dockerfile.claude", artifact: "claude" }
           - { suffix: "-gemini", dockerfile: "Dockerfile.gemini", artifact: "gemini" }
+          - { suffix: "-ggcoder", dockerfile: "Dockerfile.ggcoder", artifact: "ggcoder" }
           - { suffix: "-copilot", dockerfile: "Dockerfile.copilot", artifact: "copilot" }
           - { suffix: "-opencode", dockerfile: "Dockerfile.opencode", artifact: "opencode" }
           - { suffix: "-cursor", dockerfile: "Dockerfile.cursor", artifact: "cursor" }
@@ -132,6 +133,7 @@ jobs:
           - { suffix: "-codex", artifact: "codex" }
           - { suffix: "-claude", artifact: "claude" }
           - { suffix: "-gemini", artifact: "gemini" }
+          - { suffix: "-ggcoder", artifact: "ggcoder" }
           - { suffix: "-copilot", artifact: "copilot" }
           - { suffix: "-opencode", artifact: "opencode" }
           - { suffix: "-cursor", artifact: "cursor" }
@@ -182,6 +184,7 @@ jobs:
           - { suffix: "-codex" }
           - { suffix: "-claude" }
           - { suffix: "-gemini" }
+          - { suffix: "-ggcoder" }
           - { suffix: "-copilot" }
           - { suffix: "-opencode" }
           - { suffix: "-cursor" }
