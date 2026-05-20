@@ -836,13 +836,10 @@ mod reader_loop_tests {
         agent_stdout_writer.write_all(stale).await.unwrap();
         agent_stdout_writer.flush().await.unwrap();
 
-        let forwarded = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            sub_rx.recv(),
-        )
-        .await
-        .expect("subscriber should receive stale message before timeout")
-        .expect("subscriber channel should not be closed");
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
+            .await
+            .expect("subscriber should receive stale message before timeout")
+            .expect("subscriber channel should not be closed");
         assert_eq!(forwarded.id, Some(42));
         assert!(pending.lock().await.is_empty());
 

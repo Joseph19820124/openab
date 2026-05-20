@@ -109,6 +109,36 @@ agents:
     #   agentsMd: ""
     #   resources: {}
     #   image: "ghcr.io/openabdev/openab-opencode:latest"
+    # antigravity:
+    #   command: agy
+    #   args:
+    #     - --acp
+    #   discord:
+    #     enabled: true
+    #     allowedChannels:
+    #       - "YOUR_CHANNEL_ID"
+    #     allowedUsers: []
+    #     allowBotMessages: "off"
+    #     trustedBotIds: []
+    #   workingDir: /home/node
+    #   env: {}
+    #   envFrom: []
+    #   secretEnv: []
+    #   pool:
+    #     maxSessions: 10
+    #     sessionTtlHours: 24
+    #   reactions:
+    #     enabled: true
+    #     removeAfterReply: false
+    #     # toolDisplay: "full" (default) | "compact" | "none"
+    #   persistence:
+    #     enabled: true
+    #     existingClaim: ""  # set to reuse an existing PVC (skips PVC creation)
+    #     storageClass: ""
+    #     size: 1Gi
+    #   agentsMd: ""
+    #   resources: {}
+    #   image: "ghcr.io/openabdev/openab-antigravity:latest"
     # cursor:
     #   command: cursor-agent
     #   args:

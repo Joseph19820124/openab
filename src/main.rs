@@ -376,7 +376,8 @@ async fn main() -> anyhow::Result<()> {
         let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
         let trusted_bot_ids =
             parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
-        let allowed_role_ids = parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
+        let allowed_role_ids =
+            parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
         info!(
             allow_all_channels,
             allow_all_users,
