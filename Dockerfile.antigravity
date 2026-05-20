@@ -8,12 +8,20 @@ RUN touch src/main.rs && cargo build --release
 
 # --- Runtime stage ---
 #
-# Antigravity is Google's IDE product (not a CLI). It reuses the same
-# `cloudcode-pa.googleapis.com /v1internal:streamGenerateContent` protocol
-# that `@google/gemini-cli` speaks, but on a different host
+# Antigravity is Google's new agent platform. The official `agy` CLI
+# (https://github.com/google-antigravity/antigravity-cli) shipped at v1.0.0
+# but does NOT yet expose `--acp` (or any other stdio JSON-RPC) mode —
+# verified by inspecting v1.0.0's `--help` output and binary `strings`.
+# Its only non-interactive surface is `-p/--print`, which is one-shot and
+# cannot drive OpenAB's streaming-message / tool-approval / session-cancel
+# pipeline.
+#
+# Antigravity's backend, however, speaks the same wire protocol as
+# gemini-cli's: `/v1internal:streamGenerateContent` over the same
+# /v1internal envelope. Just on a different host
 # (`daily-cloudcode-pa.googleapis.com`) and with a different OAuth client.
 #
-# Until Google ships an official `antigravity --acp` CLI, this image:
+# So until `agy` adds ACP support, this image:
 #   1. Installs the regular @google/gemini-cli (which already implements `--acp`).
 #   2. At container startup, rewrites the OAuth client_id / client_secret /
 #      Code Assist endpoint constants in gemini-cli's bundle so requests go to

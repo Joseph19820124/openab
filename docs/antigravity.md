@@ -1,6 +1,20 @@
 # Antigravity (Experimental)
 
-> **Status:** EXPERIMENTAL. Antigravity is Google's IDE product (released as part of Google I/O 2026). There is **no official `@google/antigravity-cli` package** at the time of this writing — this image is a community-built bridge that re-uses `@google/gemini-cli`'s ACP implementation against Antigravity's backend until Google ships an official CLI.
+> **Status:** EXPERIMENTAL. Antigravity is Google's new agent platform (announced at Google I/O 2026); the CLI (`agy`) shipped at v1.0.0 alongside the IDE. **However, the official `agy` CLI does not yet expose ACP / `--acp` mode** — its only non-interactive surface is `-p / --print` which is one-shot, no streaming, no tool-approval flow. Until Google ships ACP support in `agy`, this image bridges OpenAB to Antigravity's backend by re-targeting `@google/gemini-cli`'s ACP implementation (gemini-cli speaks identical wire protocol to Antigravity, just on a different host with a different OAuth client).
+>
+> **Tracking issue for ACP support in `agy`:** [google-antigravity/antigravity-cli — feature request: add `--acp` flag](https://github.com/google-antigravity/antigravity-cli/issues) (filed by the OpenAB community).
+
+## Why this image exists when `agy` is already released
+
+Google's [`agy`](https://antigravity.google/product/antigravity-cli) (v1.0.0, May 2026) ships these CLI modes:
+
+| `agy` mode | Streams output | Tool approval | Cancel | Conversation state |
+|---|---|---|---|---|
+| Default TUI | ✅ | ✅ | ✅ | ✅ |
+| `-i / --prompt-interactive` | ✅ | ✅ | ✅ | ✅ |
+| `-p / --print` | ❌ (single block) | ❌ (auto with `--dangerously-skip-permissions`) | ❌ | New each invocation |
+
+OpenAB needs **JSON-RPC over stdio** (the ACP protocol) so it can: stream `agent_message_chunk` events, surface `agent_thought_chunk`, pause for `session/set_config_option`, deliver `session/cancel`, etc. **None of `agy`'s shipped modes provide this.** Until they do, this image uses the patched-gemini-cli approach so OpenAB's existing ACP machinery continues to work end-to-end against Antigravity's backend.
 
 ## What this gives you
 
@@ -108,7 +122,16 @@ On first launch, `gemini` (now repointed at Antigravity) opens a browser-based O
 
 ## Future replacement
 
-Once Google ships an official `@google/antigravity-cli` package (with `--acp` support), this image will become a thin wrapper around it (mirroring `Dockerfile.gemini` exactly) and the runtime patch script will be removed.
+When Google's `agy` CLI adds an `--acp` (or equivalent stdio-JSON-RPC) mode, this image can be reduced to a thin wrapper installing the official binary via its bootstrap script:
+
+```dockerfile
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+# config.toml: command = "agy", args = ["--acp"]
+```
+
+The runtime patch script in this image is a workaround for the absence of `--acp` in `agy` v1.0.0 only. Track [this feature request](https://github.com/google-antigravity/antigravity-cli/issues) for the upstream status.
 
 ## See also
 
