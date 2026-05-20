@@ -37,6 +37,9 @@ WORKDIR /home/node
 
 COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab
 
+# Install the ACP adapter wrapper for agy
+COPY agy-acp/agy-acp.mjs /usr/local/lib/agy-acp.mjs
+
 RUN mkdir -p /home/node/.config/antigravity && chown -R node:node /home/node/.config
 
 USER node

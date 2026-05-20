@@ -110,9 +110,9 @@ agents:
     #   resources: {}
     #   image: "ghcr.io/openabdev/openab-opencode:latest"
     # antigravity:
-    #   command: agy
+    #   command: node
     #   args:
-    #     - --acp
+    #     - /usr/local/lib/agy-acp.mjs
     #   discord:
     #     enabled: true
     #     allowedChannels:

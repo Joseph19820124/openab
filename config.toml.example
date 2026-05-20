@@ -83,8 +83,8 @@ working_dir = "/home/agent"
 # env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
 
 # [agent]
-# command = "agy"
-# args = ["--acp"]
+# command = "node"
+# args = ["/usr/local/lib/agy-acp.mjs"]
 # working_dir = "/home/node"
 # env = {}  # Auth via: kubectl exec -it <pod> -- agy auth
 
