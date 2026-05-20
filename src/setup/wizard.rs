@@ -383,12 +383,13 @@ fn section_agent() -> (String, String, bool) {
         "kiro:    npm install -g @koryhutchison/kiro-cli",
         "codex:   npm install -g openai-codex (requires OpenAI API key)",
         "gemini:  npm install -g @google/gemini-cli",
+        "antigravity: install the official Google Antigravity CLI",
         "",
         "Make sure the agent is in your PATH before continuing.",
     ]);
     println!();
 
-    let choices = ["claude", "kiro", "codex", "gemini"];
+    let choices = ["claude", "kiro", "codex", "gemini", "antigravity"];
     let idx = prompt_choice("  Select agent:", &choices);
     let agent = choices[idx];
 
