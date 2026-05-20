@@ -1,0 +1,123 @@
+# --- Build stage ---
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY src/ src/
+RUN touch src/main.rs && cargo build --release
+
+# --- Runtime stage ---
+#
+# Antigravity is Google's IDE product (not a CLI). It reuses the same
+# `cloudcode-pa.googleapis.com /v1internal:streamGenerateContent` protocol
+# that `@google/gemini-cli` speaks, but on a different host
+# (`daily-cloudcode-pa.googleapis.com`) and with a different OAuth client.
+#
+# Until Google ships an official `antigravity --acp` CLI, this image:
+#   1. Installs the regular @google/gemini-cli (which already implements `--acp`).
+#   2. At container startup, rewrites the OAuth client_id / client_secret /
+#      Code Assist endpoint constants in gemini-cli's bundle so requests go to
+#      Antigravity's backend with Antigravity OAuth credentials.
+#   3. Then exec's `gemini --acp` exactly like Dockerfile.gemini.
+#
+# No literal Antigravity secrets are shipped in this image. The Antigravity
+# OAuth client_id + secret are supplied at runtime via env vars:
+#     ANTIGRAVITY_OAUTH_CLIENT_ID
+#     ANTIGRAVITY_OAUTH_CLIENT_SECRET
+#     ANTIGRAVITY_API_URL   (optional, default daily-cloudcode-pa.googleapis.com)
+#
+# See docs/antigravity.md for how to obtain those values and the rationale.
+#
+# Status: EXPERIMENTAL. This image will become a thin wrapper around the
+# eventual official `@google/antigravity-cli` once Google ships it.
+#
+FROM node:22-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl procps ripgrep tini && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Gemini CLI — its --acp implementation is what we re-target.
+ARG GEMINI_CLI_VERSION=0.42.0
+RUN npm install -g @google/gemini-cli@${GEMINI_CLI_VERSION} --retry 3
+
+# Install gh CLI (parity with Dockerfile.gemini)
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Make gemini-cli's bundle directory writable by the `node` user so the runtime
+# patch script can modify it. (npm installs globally as root by default.)
+RUN GEMINI_BUNDLE=$(npm root -g)/@google/gemini-cli/bundle && \
+    chown -R node:node "$GEMINI_BUNDLE"
+
+# Antigravity runtime patch script. Runs once on first container start;
+# leaves a stamp file so subsequent restarts are no-ops.
+RUN cat > /usr/local/bin/antigravity-patch.sh <<'PATCH_SCRIPT' && \
+    chmod +x /usr/local/bin/antigravity-patch.sh
+#!/bin/bash
+set -e
+
+: "${ANTIGRAVITY_OAUTH_CLIENT_ID:?required env var ANTIGRAVITY_OAUTH_CLIENT_ID — see docs/antigravity.md}"
+: "${ANTIGRAVITY_OAUTH_CLIENT_SECRET:?required env var ANTIGRAVITY_OAUTH_CLIENT_SECRET — see docs/antigravity.md}"
+: "${ANTIGRAVITY_API_URL:=https://daily-cloudcode-pa.googleapis.com}"
+
+BUNDLE_DIR=$(npm root -g)/@google/gemini-cli/bundle
+STAMP="$BUNDLE_DIR/.antigravity-patched"
+
+if [ -f "$STAMP" ]; then
+  exit 0
+fi
+
+echo "[antigravity] patching gemini-cli bundle to target Antigravity backend..." >&2
+
+# Auto-discover gemini-cli's default OAuth values from the bundle so we don't
+# need to ship them as literals in this Dockerfile. These values are public
+# (gemini-cli is Apache-2.0); we still avoid embedding them to keep secret
+# scanners happy.
+DEFAULT_CLIENT_ID=$(grep -hoE '[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com' "$BUNDLE_DIR"/chunk-*.js 2>/dev/null | head -1 || true)
+DEFAULT_CLIENT_SECRET=$(grep -hoE 'GOCSPX-[A-Za-z0-9_-]+' "$BUNDLE_DIR"/chunk-*.js 2>/dev/null | head -1 || true)
+DEFAULT_ENDPOINT="https://cloudcode-pa.googleapis.com"
+
+if [ -z "$DEFAULT_CLIENT_ID" ] || [ -z "$DEFAULT_CLIENT_SECRET" ]; then
+  echo "[antigravity] FATAL: could not locate gemini-cli OAuth constants in bundle." >&2
+  echo "[antigravity]   This usually means the gemini-cli bundle layout changed." >&2
+  echo "[antigravity]   Try pinning GEMINI_CLI_VERSION to the version this image was tested against." >&2
+  exit 1
+fi
+
+for f in "$BUNDLE_DIR"/chunk-*.js; do
+  sed -i \
+    -e "s|${DEFAULT_CLIENT_ID}|${ANTIGRAVITY_OAUTH_CLIENT_ID}|g" \
+    -e "s|${DEFAULT_CLIENT_SECRET}|${ANTIGRAVITY_OAUTH_CLIENT_SECRET}|g" \
+    -e "s|${DEFAULT_ENDPOINT}|${ANTIGRAVITY_API_URL}|g" \
+    "$f"
+done
+
+touch "$STAMP"
+echo "[antigravity] patch complete; endpoint=${ANTIGRAVITY_API_URL}" >&2
+PATCH_SCRIPT
+
+# Wrapper that runs the patch then exec's the command. This becomes the
+# container's entrypoint so openab + gemini both see the patched bundle.
+RUN cat > /usr/local/bin/antigravity-entrypoint.sh <<'ENTRYPOINT_SCRIPT' && \
+    chmod +x /usr/local/bin/antigravity-entrypoint.sh
+#!/bin/sh
+/usr/local/bin/antigravity-patch.sh
+exec "$@"
+ENTRYPOINT_SCRIPT
+
+ENV HOME=/home/node
+WORKDIR /home/node
+
+COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab
+
+RUN mkdir -p /home/node/.gemini && chown -R node:node /home/node/.gemini
+
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENTRYPOINT ["tini", "--", "/usr/local/bin/antigravity-entrypoint.sh"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

@@ -189,6 +189,38 @@ agents:
     #     storageClass: ""
     #     size: 1Gi
     #   image: "ghcr.io/openabdev/openab-grok"
+    # antigravity:
+    #   # EXPERIMENTAL: Bridges OpenAB to Google's Antigravity backend by
+    #   # re-targeting gemini-cli's --acp implementation. See docs/antigravity.md.
+    #   command: gemini
+    #   args:
+    #     - --acp
+    #   discord:
+    #     enabled: true
+    #     allowedChannels:
+    #       - "YOUR_CHANNEL_ID"
+    #     allowedUsers: []
+    #     allowBotMessages: "off"
+    #     trustedBotIds: []
+    #   workingDir: /home/node
+    #   # ⚠️ Required env vars — see docs/antigravity.md for how to obtain values.
+    #   # Do NOT commit these to git. Prefer `secretEnv` from a Kubernetes Secret.
+    #   env: {}
+    #   secretEnv:
+    #     - name: ANTIGRAVITY_OAUTH_CLIENT_ID
+    #       secretName: antigravity-oauth
+    #       secretKey: client_id
+    #     - name: ANTIGRAVITY_OAUTH_CLIENT_SECRET
+    #       secretName: antigravity-oauth
+    #       secretKey: client_secret
+    #   pool:
+    #     maxSessions: 10
+    #     sessionTtlHours: 24
+    #   persistence:
+    #     enabled: true
+    #     storageClass: ""
+    #     size: 1Gi
+    #   image: "ghcr.io/openabdev/openab-antigravity"
     image: ""
     command: kiro-cli
     args:
