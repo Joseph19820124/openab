@@ -11,6 +11,7 @@ mod gateway;
 mod markdown;
 mod media;
 mod reactions;
+mod remind;
 mod setup;
 mod slack;
 mod stt;
@@ -298,6 +299,7 @@ async fn main() -> anyhow::Result<()> {
             ),
             allowed_users: gw_cfg.allowed_users,
             streaming: gw_cfg.streaming,
+            stt: cfg.stt.clone(),
         };
         let gw_router = router.clone();
         Some(tokio::spawn(async move {
@@ -403,6 +405,14 @@ async fn main() -> anyhow::Result<()> {
         ));
         dispatchers.lock().unwrap().push(discord_dispatcher.clone());
 
+        // Initialize reminder store (persists to $HOME/.openab/reminders.json)
+        let reminder_path = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(".openab")
+            .join("reminders.json");
+        let reminder_store = remind::ReminderStore::load(reminder_path);
+
         let handler = discord::Handler {
             router,
             allow_all_channels,
@@ -424,6 +434,8 @@ async fn main() -> anyhow::Result<()> {
             )),
             allow_dm: discord_cfg.allow_dm,
             dispatcher: discord_dispatcher,
+            reminder_store: reminder_store.clone(),
+            scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

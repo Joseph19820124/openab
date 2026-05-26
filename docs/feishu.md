@@ -165,13 +165,14 @@ The gateway downloads and forwards image and text file attachments to the AI age
 | Feishu msg_type | Handling |
 |-----------------|----------|
 | `text` | Text extracted, forwarded as prompt |
-| `image` | Image downloaded, resized (max 1200px), JPEG compressed, base64 encoded → `ContentBlock::Image` |
+| `image` | Image downloaded, resized (max 1200px), JPEG compressed, stored to `~/.openab/media/inbound/<uuid>` → `ContentBlock::Image` |
 | `file` | Text files only (`.txt`, `.py`, `.rs`, `.md`, `.json`, etc., max 512KB). Non-text files (`.pdf`, `.zip`, etc.) are silently ignored. |
+| `audio` | Voice message downloaded (opus/ogg, max 25MB), stored to filesystem, forwarded to core. If `[stt]` is enabled, core transcribes via Whisper API and injects `[Voice message transcript]: ...` into the prompt. If STT is disabled or fails, the message is silently skipped. |
 | `post` | Rich text: text nodes extracted as prompt, `img` nodes downloaded as image attachments. This is the format Feishu uses when @mention + paste image in a group. |
 
 **Group chat limitation:** Feishu does not allow @mention and image upload in the same message. However, @mention + paste (Ctrl+V) an image works — Feishu sends this as a `post` message containing both the mention and the image. Direct image upload (via the attachment button) cannot include @mention, so the bot will not respond in groups.
 
-**Processing pipeline:** Gateway downloads media using `GET /im/v1/messages/{message_id}/resources/{key}?type=image` with `tenant_access_token`, resizes to max 1200px, compresses to JPEG (quality 75), base64 encodes, and embeds in the `GatewayEvent.content.attachments` field. OAB core decodes attachments into `ContentBlock::Image` or `ContentBlock::Text` for the AI agent.
+**Processing pipeline:** Gateway downloads media using `GET /im/v1/messages/{message_id}/resources/{key}?type=image` with `tenant_access_token`, resizes to max 1200px, compresses to JPEG (quality 75), and stores to `~/.openab/media/inbound/<uuid>`. The file path is passed in `GatewayEvent.content.attachments[].path`. OAB core reads the file directly from disk and converts to `ContentBlock::Image` or `ContentBlock::Text` for the AI agent.
 
 ## Streaming (Typewriter)
 
@@ -199,6 +200,22 @@ To start a threaded conversation: reply to any bot message in a group chat (long
 **Limitation:** Messages sent directly in the Feishu thread panel (not via the "Reply" action) do not include `root_id` and will be treated as regular group messages. Use the "Reply" action to ensure thread context is preserved.
 
 Streaming (typewriter) mode works in threads — edits target the same message regardless of thread context.
+
+## Agent-Controlled Reply-To
+
+Agents can reply to a specific message using the `[[reply_to:message_id]]` output directive (see [docs/output-directives.md](output-directives.md)). The gateway sends the reply via Feishu's native Reply API, showing a quote reference in the UI.
+
+```
+Agent output:
+  [[reply_to:om_xxx]]
+  This is my reply to that specific message.
+```
+
+**How agents get message IDs:** Every incoming message includes `message_id` in the `SenderContext` injected into the agent prompt. Agents can store and reference these IDs to reply to specific messages.
+
+**Fallback:** If the specified message ID is invalid or the Reply API fails, the gateway automatically falls back to a plain send (no quote).
+
+**Use case:** In multi-bot threads, each bot can reply to a different message, creating clear visual conversation threads within a Feishu thread.
 
 ## Bot-to-Bot Collaboration (Gateway-Side Only)
 

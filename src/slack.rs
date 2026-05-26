@@ -117,6 +117,7 @@ impl SlackAdapter {
                     .ok_or_else(|| anyhow!("no user_id in auth.test response"))
             })
             .await
+            .inspect_err(|e| warn!(error = %e, "bot user ID unavailable; mention detection may suppress bot messages under Mentions mode"))
             .ok()
             .map(|s| s.as_str())
     }
@@ -200,6 +201,10 @@ impl SlackAdapter {
     /// Resolve a Bot ID (B...) to Bot User ID (U...) via bots.info API.
     /// Cached permanently (bot IDs don't change).
     async fn resolve_bot_user_id(&self, bot_id: &str) -> Option<String> {
+        if bot_id.is_empty() {
+            return None;
+        }
+
         {
             let cache = self.bot_id_cache.lock().await;
             if let Some(user_id) = cache.get(bot_id) {
@@ -210,6 +215,13 @@ impl SlackAdapter {
         let resp = self
             .api_post("bots.info", serde_json::json!({ "bot": bot_id }))
             .await
+            .inspect_err(|e| {
+                warn!(
+                    bot_id,
+                    error = %e,
+                    "failed to resolve Slack bot ID via bots.info"
+                )
+            })
             .ok()?;
         let user_id = resp.get("bot")?.get("user_id")?.as_str()?.to_string();
 
@@ -219,6 +231,21 @@ impl SlackAdapter {
             .insert(bot_id.to_string(), user_id.clone());
 
         Some(user_id)
+    }
+
+    async fn trusted_bot_ids_contains(
+        &self,
+        trusted_bot_ids: &HashSet<String>,
+        event_bot_id: &str,
+    ) -> bool {
+        if trusted_bot_ids.is_empty() {
+            return true;
+        }
+        if bot_id_matches_trusted(trusted_bot_ids, event_bot_id, None) {
+            return true;
+        }
+        let resolved = self.resolve_bot_user_id(event_bot_id).await;
+        bot_id_matches_trusted(trusted_bot_ids, event_bot_id, resolved.as_deref())
     }
 
     /// Check whether the bot has participated in a Slack thread and whether
@@ -281,7 +308,7 @@ impl SlackAdapter {
         let parent_mentions_bot = messages
             .first()
             .and_then(|m| m["text"].as_str())
-            .is_some_and(|text| text.contains(&format!("<@{bot_id}>")));
+            .is_some_and(|text| text_mentions_uid(text, bot_id));
 
         let bot_posted = messages.iter().any(|m| m["user"].as_str() == Some(bot_id));
 
@@ -538,11 +565,11 @@ pub async fn run_slack_adapter(
                                                         AllowBots::Mentions | AllowBots::All => {
                                                             if !trusted_bot_ids.is_empty() {
                                                                 let event_bot_id = event["bot_id"].as_str().unwrap_or("");
-                                                                let resolved = adapter.resolve_bot_user_id(event_bot_id).await;
-                                                                let is_trusted = resolved.as_ref()
-                                                                    .is_some_and(|uid| trusted_bot_ids.contains(uid.as_str()));
+                                                                let is_trusted = adapter
+                                                                    .trusted_bot_ids_contains(&trusted_bot_ids, event_bot_id)
+                                                                    .await;
                                                                 if !is_trusted {
-                                                                    debug!(event_bot_id, resolved = ?resolved, "bot not in trusted_bot_ids, ignoring app_mention");
+                                                                    debug!(event_bot_id, "bot not in trusted_bot_ids, ignoring app_mention");
                                                                     continue;
                                                                 }
                                                             }
@@ -581,7 +608,7 @@ pub async fn run_slack_adapter(
                                                 let bot_uid_opt = adapter.get_bot_user_id().await.map(|s| s.to_string());
                                                 let mentions_bot = bot_uid_opt
                                                     .as_ref()
-                                                    .is_some_and(|bot_uid| msg_text.contains(&format!("<@{bot_uid}>")));
+                                                    .is_some_and(|bot_uid| text_mentions_uid(msg_text, bot_uid));
                                                 let is_dm = channel_id.starts_with('D');
                                                 let event_user_id = event["user"].as_str();
                                                 let is_own_bot_msg = is_bot
@@ -713,12 +740,11 @@ pub async fn run_slack_adapter(
                                                     }
                                                     // Check trusted_bot_ids
                                                     if !trusted_bot_ids.is_empty() {
-                                                        let resolved = adapter.resolve_bot_user_id(event_bot_id).await;
-                                                        let is_trusted = resolved
-                                                            .as_ref()
-                                                            .is_some_and(|uid| trusted_bot_ids.contains(uid.as_str()));
+                                                        let is_trusted = adapter
+                                                            .trusted_bot_ids_contains(&trusted_bot_ids, event_bot_id)
+                                                            .await;
                                                         if !is_trusted {
-                                                            debug!(event_bot_id, resolved = ?resolved, "bot not in trusted_bot_ids, ignoring");
+                                                            debug!(event_bot_id, "bot not in trusted_bot_ids, ignoring");
                                                             continue;
                                                         }
                                                     }
@@ -934,6 +960,7 @@ async fn handle_message(
     let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
     let mut text_file_bytes: u64 = 0;
     let mut text_file_count: u32 = 0;
+    let mut failed_image_files: Vec<String> = Vec::new();
 
     if let Some(files) = files {
         for file in files {
@@ -1032,18 +1059,76 @@ async fn handle_message(
                     debug!(filename, "adding text file attachment");
                     extra_blocks.push(block);
                 }
-            } else if let Some(block) = media::download_and_encode_image(
-                url,
-                Some(mimetype),
-                filename,
-                size,
-                Some(bot_token),
-            )
-            .await
-            {
-                debug!(filename, "adding image attachment");
-                extra_blocks.push(block);
+            } else {
+                match media::download_and_encode_image(
+                    url,
+                    Some(mimetype),
+                    filename,
+                    size,
+                    Some(bot_token),
+                )
+                .await
+                {
+                    Ok(block) => {
+                        debug!(filename, "adding image attachment");
+                        extra_blocks.push(block);
+                    }
+                    Err(media::MediaFetchError::NotAnImage) => {}
+                    Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
+                        warn!(filename, actual, limit, "image exceeds size limit");
+                        failed_image_files.push(filename.to_string());
+                    }
+                    Err(
+                        media::MediaFetchError::UnsupportedResponseType { .. }
+                        | media::MediaFetchError::InvalidImageBody { .. },
+                    ) => {
+                        warn!(
+                            filename,
+                            "image validation failed; server may have returned non-image content"
+                        );
+                        failed_image_files.push(filename.to_string());
+                    }
+                    Err(media::MediaFetchError::ProcessingFailed(ref e)) => {
+                        warn!(filename, error = %e, "image post-processing failed");
+                        failed_image_files.push(filename.to_string());
+                    }
+                    Err(media::MediaFetchError::HttpStatus(status))
+                        if status.is_client_error() =>
+                    {
+                        warn!(filename, %status, "image download denied");
+                        failed_image_files.push(filename.to_string());
+                    }
+                    Err(e) => {
+                        warn!(filename, error = %e, "image download failed");
+                        failed_image_files.push(filename.to_string());
+                    }
+                }
             }
+        }
+    }
+
+    // Notify user if any images couldn't be processed.
+    if !failed_image_files.is_empty() {
+        let warn_channel = ChannelRef {
+            platform: "slack".into(),
+            channel_id: channel_id.clone(),
+            thread_id: thread_ts.clone().or_else(|| Some(ts.clone())),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let file_list = failed_image_files
+            .iter()
+            .map(|n| sanitize_slack_filename(n))
+            .collect::<Vec<_>>()
+            .join("`, `");
+        let msg = format!(
+            ":warning: I couldn't process the file(s) you shared (`{file_list}`). \
+             This can happen when the bot lacks the `files:read` OAuth scope, \
+             the file format isn't supported (PNG/JPEG/GIF/WebP only), \
+             or the file is too large."
+        );
+        if let Err(e) = adapter.send_message(&warn_channel, &msg).await {
+            warn!(error = %e, "failed to send image validation warning to user");
         }
     }
 
@@ -1064,6 +1149,7 @@ async fn handle_message(
         is_bot: is_bot_msg,
         timestamp: Some(crate::timestamp::slack_ts_to_iso8601(&ts)),
         message_id: Some(ts.clone()),
+        receiver_id: bot_id.map(|id| id.to_string()),
     };
 
     let trigger_msg = MessageRef {
@@ -1142,15 +1228,41 @@ async fn handle_message(
     }
 }
 
-/// Strip only the bot's own `<@BOT_UID>` trigger mention.
+/// Strip all occurrences of the bot's own `<@BOT_UID>` or `<@BOT_UID|handle>` mention.
 /// Other users' mentions stay intact so the LLM can @-mention them back.
 /// If the bot UID isn't known, fall back to returning the text trimmed —
 /// safer than stripping all mentions and losing user addressability.
 fn resolve_slack_mentions(text: &str, bot_id: Option<&str>) -> String {
-    match bot_id {
-        Some(id) => text.replace(&format!("<@{id}>"), "").trim().to_string(),
-        None => text.trim().to_string(),
+    let Some(id) = bot_id else {
+        return text.trim().to_string();
+    };
+    let prefix = format!("<@{id}");
+    let mut out = String::with_capacity(text.len());
+    let mut s = text;
+    while let Some(pos) = s.find(&prefix) {
+        let after = &s[pos + prefix.len()..];
+        match after.as_bytes().first() {
+            Some(b'>') => {
+                out.push_str(&s[..pos]);
+                s = &after[1..];
+            }
+            Some(b'|') => {
+                if let Some(close) = after.find('>') {
+                    out.push_str(&s[..pos]);
+                    s = &after[close + 1..];
+                } else {
+                    out.push_str(&s[..pos + prefix.len()]);
+                    s = after;
+                }
+            }
+            _ => {
+                out.push_str(&s[..pos + prefix.len()]);
+                s = after;
+            }
+        }
     }
+    out.push_str(s);
+    out.trim().to_string()
 }
 
 /// Pick the best download URL for a Slack file object. `url_private_download`
@@ -1163,11 +1275,49 @@ fn slack_file_download_url(file: &serde_json::Value) -> &str {
         .unwrap_or("")
 }
 
-/// Strip MIME parameters like `; charset=utf-8` so type-detection helpers see
-/// the bare media type. Slack occasionally sends mimetypes like
-/// `text/plain; charset=utf-8`; `media::is_text_file` expects the bare form.
+/// Strip MIME parameters so type-detection helpers see the bare media type.
+/// Delegates to media::strip_mime_params (single source of truth).
+/// Needed because Slack occasionally sends `text/plain; charset=utf-8` and
+/// `media::is_text_file` expects the bare form.
 fn strip_mime_params(mimetype: &str) -> &str {
-    mimetype.split(';').next().unwrap_or(mimetype).trim()
+    media::strip_mime_params(mimetype)
+}
+
+/// Sanitize a filename for safe embedding in a Slack mrkdwn message.
+///
+/// Ampersands (`&`), backticks (`` ` ``), and angle brackets (`<`, `>`) are escaped.
+/// `&` is encoded as `&amp;` first because Slack decodes HTML entities before parsing
+/// mrkdwn — a filename like `&lt;@here&gt;` would otherwise round-trip back to
+/// `<@here>` and trigger a mention ping. Backticks and angle brackets are Slack
+/// mrkdwn delimiters; without escaping, `<!here>` or `` `<@U123>` `` would render
+/// as mentions or @-here pings.
+pub(crate) fn sanitize_slack_filename(s: &str) -> String {
+    s.replace('&', "&amp;").replace('`', "'").replace('<', "(").replace('>', ")")
+}
+
+/// Returns `true` if `text` contains a Slack user mention for `uid`.
+///
+/// Accepts both `<@U...>` (bare) and `<@U...|handle>` (labelled) wire forms.
+/// Slack (and bots addressing peers) can emit the labelled form; `<@UID>` is
+/// not a substring of `<@UID|handle>`, so a bare `contains("<@UID>")` silently
+/// misses it.
+fn text_mentions_uid(text: &str, uid: &str) -> bool {
+    let prefix = format!("<@{uid}");
+    text.match_indices(&prefix)
+        .any(|(i, _)| matches!(text.as_bytes().get(i + prefix.len()), Some(b'>') | Some(b'|')))
+}
+
+fn bot_id_matches_trusted(
+    trusted_bot_ids: &HashSet<String>,
+    event_bot_id: &str,
+    resolved_user_id: Option<&str>,
+) -> bool {
+    if event_bot_id.is_empty() {
+        return false;
+    }
+
+    trusted_bot_ids.contains(event_bot_id)
+        || resolved_user_id.is_some_and(|uid| trusted_bot_ids.contains(uid))
 }
 
 /// True only when a Slack non-bot event represents a real user message
@@ -1250,6 +1400,89 @@ mod tests {
     fn resolve_mentions_unknown_bot_preserves_all() {
         let out = resolve_slack_mentions("<@U1BOT> hi <@U2ALICE>", None);
         assert_eq!(out, "<@U1BOT> hi <@U2ALICE>");
+    }
+
+    /// Labelled form of another user's mention (`<@UID|handle>`) is preserved.
+    #[test]
+    fn resolve_mentions_preserves_labelled_other_user_mention() {
+        let out = resolve_slack_mentions("<@U1BOT> say hi to <@U2ALICE|alice>", Some("U1BOT"));
+        assert_eq!(out, "say hi to <@U2ALICE|alice>");
+    }
+
+    /// Labelled form `<@UID|handle>` is stripped the same as bare form.
+    #[test]
+    fn resolve_mentions_strips_labelled_bot_mention() {
+        let out = resolve_slack_mentions("<@U1BOT|my-bot> hello", Some("U1BOT"));
+        assert_eq!(out, "hello");
+    }
+
+    /// Labelled form mid-sentence is stripped and surrounding text preserved.
+    #[test]
+    fn resolve_mentions_strips_labelled_mid_sentence() {
+        let out = resolve_slack_mentions("please ask <@U1BOT|handle> to run", Some("U1BOT"));
+        assert_eq!(out, "please ask  to run");
+    }
+
+    /// Mixed bare and labelled forms of the same UID in one string are both stripped.
+    #[test]
+    fn resolve_mentions_strips_mixed_bare_and_labelled() {
+        let out = resolve_slack_mentions("<@U1BOT> and <@U1BOT|handle> run", Some("U1BOT"));
+        assert_eq!(out, "and  run");
+    }
+
+    /// Malformed unclosed `<@UID|label` (no closing `>`) is preserved verbatim.
+    #[test]
+    fn resolve_mentions_malformed_unclosed_label_preserved() {
+        let out = resolve_slack_mentions("ask <@U1BOT|nolabel to run", Some("U1BOT"));
+        assert!(out.contains("<@U1BOT"));
+    }
+
+    #[test]
+    fn resolve_mentions_preserves_longer_uid_prefix() {
+        let out = resolve_slack_mentions("<@U1BOTX> hello", Some("U1BOT"));
+        assert_eq!(out, "<@U1BOTX> hello");
+    }
+
+    // --- text_mentions_uid tests ---
+
+    #[test]
+    fn mentions_uid_bare_form() {
+        assert!(text_mentions_uid("<@U123BOT> hello", "U123BOT"));
+    }
+
+    #[test]
+    fn mentions_uid_labelled_form() {
+        assert!(text_mentions_uid("<@U123BOT|my-bot> hello", "U123BOT"));
+    }
+
+    #[test]
+    fn mentions_uid_labelled_form_mid_sentence() {
+        assert!(text_mentions_uid("please ask <@U123BOT|handle> to run", "U123BOT"));
+    }
+
+    #[test]
+    fn mentions_uid_no_match() {
+        assert!(!text_mentions_uid("hello world", "U123BOT"));
+    }
+
+    #[test]
+    fn mentions_uid_no_false_positive_on_uid_prefix() {
+        assert!(!text_mentions_uid("<@U123BOT> hello", "U123"));
+    }
+
+    #[test]
+    fn mentions_uid_second_mention_matches() {
+        assert!(text_mentions_uid("<@U999OTHER> and <@U123BOT>", "U123BOT"));
+    }
+
+    #[test]
+    fn mentions_uid_empty_label_form() {
+        assert!(text_mentions_uid("<@U123BOT|> hello", "U123BOT"));
+    }
+
+    #[test]
+    fn mentions_uid_truncated_no_closing_delimiter() {
+        assert!(!text_mentions_uid("<@U123BOT", "U123BOT"));
     }
 
     // --- is_plain_user_message tests (regression for openabdev/openab#497 parity) ---
@@ -1337,6 +1570,45 @@ mod tests {
         assert_eq!(slack_file_download_url(&file), "");
     }
 
+    // --- sanitize_slack_filename tests ---
+
+    #[test]
+    fn sanitize_leaves_normal_filename_unchanged() {
+        assert_eq!(sanitize_slack_filename("photo.png"), "photo.png");
+        assert_eq!(sanitize_slack_filename("my file (1).jpg"), "my file (1).jpg");
+    }
+
+    #[test]
+    fn sanitize_replaces_backtick() {
+        assert_eq!(sanitize_slack_filename("file`name.png"), "file'name.png");
+    }
+
+    #[test]
+    fn sanitize_replaces_angle_brackets() {
+        // Angle brackets are Slack mrkdwn delimiters; they must not pass through.
+        assert_eq!(sanitize_slack_filename("<@U123>"), "(@U123)");
+        assert_eq!(sanitize_slack_filename("<!here>"), "(!here)");
+    }
+
+    #[test]
+    fn sanitize_combined_injection_attempt() {
+        // A filename constructed to inject a Slack @here ping.
+        assert_eq!(
+            sanitize_slack_filename("`<!here>`"),
+            "'(!here)'"
+        );
+    }
+
+    #[test]
+    fn sanitize_escapes_ampersand_before_angle_brackets() {
+        // Slack mrkdwn decodes HTML entities before markup parsing.
+        // "&lt;@here&gt;" would round-trip back to "<@here>" and trigger a mention
+        // ping if & is not escaped. The & must be escaped first so downstream
+        // Slack entity decoding cannot reconstruct a mrkdwn delimiter.
+        assert_eq!(sanitize_slack_filename("&lt;@here&gt;"), "&amp;lt;@here&amp;gt;");
+        assert_eq!(sanitize_slack_filename("file&name.png"), "file&amp;name.png");
+    }
+
     // --- strip_mime_params tests ---
 
     /// MIME with charset parameter strips to bare media type.
@@ -1361,6 +1633,36 @@ mod tests {
     #[test]
     fn strip_mime_params_trims_whitespace() {
         assert_eq!(strip_mime_params("  text/plain  "), "text/plain");
+    }
+
+    // --- bot_id_matches_trusted tests ---
+
+    #[test]
+    fn trusted_bot_ids_accepts_raw_slack_bot_id() {
+        let trusted = HashSet::from(["B123BOT".to_string()]);
+        assert!(bot_id_matches_trusted(&trusted, "B123BOT", None));
+    }
+
+    #[test]
+    fn trusted_bot_ids_accepts_resolved_bot_user_id() {
+        let trusted = HashSet::from(["U123BOT".to_string()]);
+        assert!(bot_id_matches_trusted(
+            &trusted,
+            "B123BOT",
+            Some("U123BOT")
+        ));
+    }
+
+    #[test]
+    fn trusted_bot_ids_rejects_unknown_bot_when_resolution_fails() {
+        let trusted = HashSet::from(["U123BOT".to_string()]);
+        assert!(!bot_id_matches_trusted(&trusted, "B999BOT", None));
+    }
+
+    #[test]
+    fn trusted_bot_ids_rejects_empty_event_bot_id() {
+        let trusted = HashSet::from(["".to_string()]);
+        assert!(!bot_id_matches_trusted(&trusted, "", None));
     }
 
     /// Per-thread streaming: ON by default, OFF when another bot is present (#534).

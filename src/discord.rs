@@ -1,19 +1,21 @@
 use crate::acp::protocol::ConfigOption;
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
-use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
+use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
 use crate::media;
+use crate::remind::{self, ReminderStore};
 use async_trait::async_trait;
 use serenity::builder::{
-    CreateActionRow, CreateButton, CreateCommand, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind,
-    CreateSelectMenuOption, CreateThread, EditMessage,
+    CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
+    CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
+    CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage,
+    GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
-use serenity::model::application::{Command, ComponentInteractionDataKind, Interaction};
+use serenity::model::application::{Command, CommandOptionType, ComponentInteractionDataKind, Interaction};
 use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
@@ -32,6 +34,9 @@ const PARTICIPATION_CACHE_MAX: usize = 1000;
 
 /// Discord StringSelectMenu hard limit on options.
 const SELECT_MENU_PAGE_SIZE: usize = 25;
+
+/// Avoid unbounded Discord history exports from very large threads.
+const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
 
 // --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
 
@@ -89,7 +94,10 @@ impl ChatAdapter for DiscordAdapter {
         let builder = serenity::builder::CreateMessage::new()
             .content(content)
             .reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)));
-        match ChannelId::new(ch_id).send_message(&self.http, builder).await {
+        match ChannelId::new(ch_id)
+            .send_message(&self.http, builder)
+            .await
+        {
             Ok(msg) => Ok(MessageRef {
                 channel: channel.clone(),
                 message_id: msg.id.to_string(),
@@ -105,7 +113,9 @@ impl ChatAdapter for DiscordAdapter {
     async fn delete_message(&self, msg: &MessageRef) -> anyhow::Result<()> {
         let ch_id: u64 = Self::resolve_channel(&msg.channel).parse()?;
         let msg_id: u64 = msg.message_id.parse()?;
-        self.http.delete_message(ChannelId::new(ch_id), MessageId::new(msg_id), None).await?;
+        self.http
+            .delete_message(ChannelId::new(ch_id), MessageId::new(msg_id), None)
+            .await?;
         Ok(())
     }
 
@@ -207,6 +217,10 @@ pub struct Handler {
     pub allow_dm: bool,
     /// Per-thread dispatcher (Message mode uses cap=1 for FIFO; Thread/Lane use configured cap).
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
+    /// Reminder store for /remind slash command.
+    pub reminder_store: ReminderStore,
+    /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
+    pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Handler {
@@ -388,7 +402,25 @@ impl EventHandler for Handler {
                                 .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
                                 .await;
                             if participated {
-                                let _ = msg.channel_id.say(&ctx.http, &user_message).await;
+                                // Dedup: skip if another bot already posted the same
+                                // warning in this thread. Prevents N duplicate warnings
+                                // when N bot processes each hit the soft limit. (#530)
+                                let recent = msg
+                                    .channel_id
+                                    .messages(
+                                        &ctx.http,
+                                        serenity::builder::GetMessages::new().limit(10),
+                                    )
+                                    .await
+                                    .unwrap_or_default();
+                                let pairs: Vec<(bool, &str)> = recent
+                                    .iter()
+                                    .map(|m| (m.author.bot, m.content.as_str()))
+                                    .collect();
+                                let already_warned = turn_limit_warning_present(&pairs);
+                                if !already_warned {
+                                    let _ = msg.channel_id.say(&ctx.http, &user_message).await;
+                                }
                             }
                         }
                         return;
@@ -415,10 +447,13 @@ impl EventHandler for Handler {
         let in_allowed_channel =
             self.allow_all_channels || self.allowed_channels.contains(&channel_id);
 
-        let is_mentioned =
-            msg.mentions_user_id(bot_id) || msg.content.contains(&format!("<@{}>", bot_id))
+        let is_mentioned = msg.mentions_user_id(bot_id)
+            || msg.content.contains(&format!("<@{}>", bot_id))
             || (!self.allowed_role_ids.is_empty()
-                && msg.mention_roles.iter().any(|r| self.allowed_role_ids.contains(&r.get())));
+                && msg
+                    .mention_roles
+                    .iter()
+                    .any(|r| self.allowed_role_ids.contains(&r.get())));
 
         // Bot message gating (from upstream #321)
         if msg.author.bot {
@@ -630,12 +665,14 @@ impl EventHandler for Handler {
             msg.author.bot,
             &msg.timestamp.to_rfc3339().unwrap_or_default(),
             &msg.id.to_string(),
+            &bot_id.to_string(),
         );
 
         // Build extra content blocks from attachments (audio -> STT, text -> inline,
         // image -> encode, video -> URL for agent-side inspection).
         let mut extra_blocks = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
+        let mut failed_image_files: Vec<String> = Vec::new();
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
@@ -701,25 +738,44 @@ impl EventHandler for Handler {
                     debug!(filename = %attachment.filename, "adding text file attachment");
                     extra_blocks.push(block);
                 }
-            } else if let Some(block) = media::download_and_encode_image(
-                &attachment.url,
-                attachment.content_type.as_deref(),
-                &attachment.filename,
-                u64::from(attachment.size),
-                None,
-            )
-            .await
-            {
-                debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
-                extra_blocks.push(block);
-            } else if media::is_video_file(&attachment.filename, attachment.content_type.as_deref()) {
-                debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
-                extra_blocks.push(video_attachment_block(
-                    &attachment.filename,
-                    attachment.content_type.as_deref(),
-                    u64::from(attachment.size),
+            } else {
+                match media::download_and_encode_image(
                     &attachment.url,
-                ));
+                    attachment.content_type.as_deref(),
+                    &attachment.filename,
+                    u64::from(attachment.size),
+                    None,
+                )
+                .await
+                {
+                    Ok(block) => {
+                        debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                        extra_blocks.push(block);
+                    }
+                    Err(media::MediaFetchError::NotAnImage) => {
+                        if media::is_video_file(
+                            &attachment.filename,
+                            attachment.content_type.as_deref(),
+                        ) {
+                            debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
+                            extra_blocks.push(video_attachment_block(
+                                &attachment.filename,
+                                attachment.content_type.as_deref(),
+                                u64::from(attachment.size),
+                                &attachment.url,
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            url = %attachment.url,
+                            filename = %attachment.filename,
+                            error = %e,
+                            "image attachment failed"
+                        );
+                        failed_image_files.push(attachment.filename.clone());
+                    }
+                }
             }
         }
 
@@ -748,6 +804,23 @@ impl EventHandler for Handler {
                 }
             }
         };
+
+        // Notify user if any images couldn't be processed.
+        if !failed_image_files.is_empty() {
+            let file_list = failed_image_files
+                .iter()
+                .map(|n| format!("`{}`", n.replace('`', "'")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let warn_msg = format!(
+                ":warning: I couldn't process the image(s) you shared ({}). \
+                 The files may be inaccessible or in an unsupported format (PNG/JPEG/GIF/WebP only).",
+                file_list
+            );
+            if let Err(e) = adapter.send_message(&thread_channel, &warn_msg).await {
+                tracing::warn!(error = %e, "failed to send image warning to user");
+            }
+        }
 
         let trigger_msg = discord_msg_ref(&msg);
 
@@ -814,22 +887,82 @@ impl EventHandler for Handler {
             CreateCommand::new("cancel-all")
                 .description("Cancel current operation and drop all buffered messages"),
             CreateCommand::new("reset").description("Reset the conversation session"),
+            CreateCommand::new("remind")
+                .description("Set a one-shot reminder to mention users/roles after a delay")
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "targets",
+                    "Users/roles to mention (e.g. @user1 @role1)",
+                ).required(true))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "message",
+                    "Reminder message",
+                ).required(true))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "delay",
+                    "Delay before firing (e.g. 30m, 2h, 1d)",
+                ).required(true)),
+            CreateCommand::new("export-thread")
+                .description("Download this thread as a text file")
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::Integer,
+                    "limit",
+                    "Export only the most recent N messages (1–5000)",
+                ))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "since",
+                    "Export messages after this message ID",
+                ))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::Integer,
+                    "days",
+                    "Export messages from the last N days (1–365)",
+                ))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::Boolean,
+                    "all",
+                    "Export all messages (up to 5000). Default is last 100.",
+                )),
         ];
 
-        // Register global commands (works in DMs + all guilds after propagation).
+        // Register global commands only. Registering the same commands per-guild
+        // makes Discord show duplicate slash commands in guild command pickers.
         if let Err(e) = Command::set_global_commands(&ctx.http, commands.clone()).await {
             tracing::warn!(error = %e, "failed to register global slash commands");
         } else {
             info!("registered global slash commands");
         }
 
-        // Also register per-guild for instant availability (global can take up to 1h).
+        // One-time migration cleanup: older versions registered the same
+        // slash commands per-guild, and Discord persists those server-side.
+        // Keep guild command sets empty so only global commands are shown.
         for guild in &ready.guilds {
             let guild_id = guild.id;
-            if let Err(e) = guild_id.set_commands(&ctx.http, commands.clone()).await {
-                tracing::warn!(%guild_id, error = %e, "failed to register guild slash commands");
-            } else {
-                info!(%guild_id, "registered guild slash commands");
+            if let Err(e) = guild_id.set_commands(&ctx.http, Vec::new()).await {
+                tracing::warn!(
+                    %guild_id,
+                    error = %e,
+                    "failed to clear stale guild slash commands"
+                );
+            }
+        }
+
+        // Re-schedule any pending reminders that survived a restart.
+        let pending = self.reminder_store.pending().await;
+        if !pending.is_empty() {
+            let mut scheduled = self.scheduled_ids.lock().await;
+            let mut count = 0;
+            for r in pending {
+                if scheduled.insert(r.id.clone()) {
+                    remind::schedule_reminder(ctx.http.clone(), self.reminder_store.clone(), r);
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                info!(count, "re-scheduled pending reminders");
             }
         }
     }
@@ -852,6 +985,12 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "reset" => {
                 self.handle_reset_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "remind" => {
+                self.handle_remind_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "export-thread" => {
+                self.handle_export_thread_command(&ctx, &cmd).await;
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
@@ -1115,6 +1254,322 @@ impl Handler {
         }
     }
 
+    async fn handle_remind_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        // Only humans can use /remind
+        if cmd.user.bot {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Only humans can set reminders.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        // Extract options
+        let opts = &cmd.data.options;
+        let targets_raw = opts.iter()
+            .find(|o| o.name == "targets")
+            .and_then(|o| o.value.as_str())
+            .unwrap_or("");
+        let message = opts.iter()
+            .find(|o| o.name == "message")
+            .and_then(|o| o.value.as_str())
+            .unwrap_or("");
+        let delay_raw = opts.iter()
+            .find(|o| o.name == "delay")
+            .and_then(|o| o.value.as_str())
+            .unwrap_or("");
+
+        if targets_raw.is_empty() || message.is_empty() || delay_raw.is_empty() {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ All fields (targets, message, delay) are required.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        // Parse delay
+        let delay_secs = match remind::parse_delay(delay_raw) {
+            Ok(s) => s,
+            Err(e) => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!("⚠️ Invalid delay: {e}"))
+                        .ephemeral(true),
+                );
+                let _ = cmd.create_response(&ctx.http, response).await;
+                return;
+            }
+        };
+
+        if let Err(e) = remind::validate_message(message) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!("⚠️ {e}"))
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        // Strip @everyone / @here to prevent unintended mass pings.
+        let message = remind::sanitize_message(message);
+
+        // Extract mention strings from targets (keep raw — Discord renders them)
+        let targets: Vec<String> = targets_raw
+            .split_whitespace()
+            .filter(|t| t.starts_with("<@") && t.ends_with('>'))
+            .map(|t| t.to_string())
+            .collect();
+
+        if targets.is_empty() {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ No valid mentions found in targets. Use @user or @role.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        if targets.len() > remind::MAX_TARGETS {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!("⚠️ Too many targets (max {}). Use a @role instead.", remind::MAX_TARGETS))
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        // F4: Per-user rate limit (max 5 active reminders)
+        let user_id = cmd.user.id.get();
+        let pending = self.reminder_store.pending().await;
+        let user_count = pending.iter().filter(|r| r.sender_id == user_id).count();
+        if user_count >= 5 {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ You already have 5 active reminders. Wait for some to fire before adding more.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let fire_at = chrono::Utc::now() + chrono::Duration::seconds(delay_secs as i64);
+        let reminder = remind::Reminder {
+            id: uuid::Uuid::new_v4().to_string(),
+            channel_id: cmd.channel_id.get(),
+            sender_id: cmd.user.id.get(),
+            targets: targets.clone(),
+            message: message.clone(),
+            fire_at,
+            created_at: chrono::Utc::now(),
+        };
+
+        // Persist and schedule
+        self.reminder_store.add(reminder.clone()).await;
+        self.scheduled_ids.lock().await.insert(reminder.id.clone());
+        remind::schedule_reminder(ctx.http.clone(), self.reminder_store.clone(), reminder);
+
+        let delay_str = remind::format_delay(delay_secs);
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content(format!(
+                    "⏰ Reminder set! Will fire in **{delay_str}** and mention {}",
+                    targets.join(" ")
+                ))
+                .ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, "failed to respond to /remind command");
+        }
+    }
+
+    async fn handle_export_thread_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            cmd.user.id.get(),
+        ) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 You are not allowed to use this bot.")
+                    .ephemeral(true),
+            );
+            if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                tracing::error!(error = %e, "failed to deny /export-thread command");
+            }
+            return;
+        }
+
+        let channel_id = cmd.channel_id;
+        let (export_allowed, export_name) = match channel_id.to_channel(&ctx.http).await {
+            Ok(serenity::model::channel::Channel::Guild(gc)) => {
+                let in_allowed_channel =
+                    self.allow_all_channels || self.allowed_channels.contains(&channel_id.get());
+                let (in_thread, _) = detect_thread(
+                    gc.thread_metadata.is_some(),
+                    gc.parent_id.map(|id| id.get()),
+                    gc.owner_id.map(|id| id.get()),
+                    ctx.cache.current_user().id.get(),
+                    &self.allowed_channels,
+                    self.allow_all_channels,
+                    in_allowed_channel,
+                );
+                (in_thread, gc.name.clone())
+            }
+            Ok(serenity::model::channel::Channel::Private(_)) => {
+                (self.allow_dm, "dm".to_string())
+            }
+            Ok(_) => (false, "channel".to_string()),
+            Err(e) => {
+                tracing::warn!(channel_id = %channel_id, error = %e, "failed to inspect channel for export");
+                (false, "channel".to_string())
+            }
+        };
+
+        if !export_allowed {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Run this command inside an allowed Discord thread or DM.")
+                    .ephemeral(true),
+            );
+            if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                tracing::error!(error = %e, "failed to respond to /export-thread rejection");
+            }
+            return;
+        }
+
+        // --- Parse and validate filter params (mutual exclusion) ---
+        let opts = &cmd.data.options;
+        let limit_opt = opts.iter().find(|o| o.name == "limit").and_then(|o| o.value.as_i64());
+        let since_opt = opts.iter().find(|o| o.name == "since").and_then(|o| o.value.as_str());
+        let days_opt = opts.iter().find(|o| o.name == "days").and_then(|o| o.value.as_i64());
+        let all_opt = opts.iter().find(|o| o.name == "all").and_then(|o| o.value.as_bool()).unwrap_or(false);
+
+        let filter_count = limit_opt.is_some() as u8 + since_opt.is_some() as u8 + days_opt.is_some() as u8 + all_opt as u8;
+        if filter_count > 1 {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Please specify only one filter: `limit`, `since`, `days`, or `all`.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let filter = if all_opt {
+            ExportFilter::All
+        } else if let Some(n) = limit_opt {
+            if !(1..=5000).contains(&n) {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ `limit` must be between 1 and 5000.")
+                        .ephemeral(true),
+                );
+                let _ = cmd.create_response(&ctx.http, response).await;
+                return;
+            }
+            ExportFilter::Limit(n as usize)
+        } else if let Some(id_str) = since_opt {
+            match id_str.parse::<u64>() {
+                Ok(id) if id > 0 => ExportFilter::After(MessageId::new(id)),
+                _ => {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ `since` must be a valid message ID (right-click a message → Copy Message ID).")
+                            .ephemeral(true),
+                    );
+                    let _ = cmd.create_response(&ctx.http, response).await;
+                    return;
+                }
+            }
+        } else if let Some(d) = days_opt {
+            if !(1..=365).contains(&d) {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ `days` must be between 1 and 365.")
+                        .ephemeral(true),
+                );
+                let _ = cmd.create_response(&ctx.http, response).await;
+                return;
+            }
+            let since_ts = chrono::Utc::now() - chrono::Duration::days(d);
+            let ts_ms = since_ts.timestamp_millis() as u64;
+            ExportFilter::After(timestamp_ms_to_snowflake(ts_ms))
+        } else {
+            // Default: export last 100 messages (use limit:N or all:true for more)
+            ExportFilter::Limit(100)
+        };
+
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content("Preparing thread export...")
+                .ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, "failed to acknowledge /export-thread command");
+            return;
+        }
+
+        match export_channel_messages(
+            &ctx.http,
+            channel_id,
+            &export_name,
+            cmd.attachment_size_limit,
+            filter,
+        )
+        .await
+        {
+            Ok(result) => {
+                let mut content = format!("Exported {} messages.", result.written);
+                if result.hit_cap {
+                    content.push_str(&format!(
+                        " Only the most recent {} messages were fetched — older messages were not included.",
+                        result.fetched
+                    ));
+                }
+                if result.byte_truncated {
+                    content.push_str(&format!(
+                        " Transcript truncated to fit Discord's attachment size limit ({} of {} fetched messages included).",
+                        result.written, result.fetched
+                    ));
+                }
+                let attachment =
+                    CreateAttachment::bytes(result.transcript.into_bytes(), result.filename);
+                let followup = CreateInteractionResponseFollowup::new()
+                    .content(content)
+                    .add_file(attachment)
+                    .ephemeral(true);
+                if let Err(e) = cmd.create_followup(&ctx.http, followup).await {
+                    tracing::error!(error = %e, "failed to send /export-thread attachment");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(channel_id = %channel_id, error = %e, "failed to export thread");
+                let followup = CreateInteractionResponseFollowup::new()
+                    .content(format!("⚠️ Failed to export thread: {e}"))
+                    .ephemeral(true);
+                if let Err(e) = cmd.create_followup(&ctx.http, followup).await {
+                    tracing::error!(error = %e, "failed to send /export-thread error");
+                }
+            }
+        }
+    }
+
     async fn handle_config_select(
         &self,
         ctx: &Context,
@@ -1231,6 +1686,283 @@ fn discord_msg_ref(msg: &Message) -> MessageRef {
     }
 }
 
+struct ExportResult {
+    filename: String,
+    transcript: String,
+    /// Messages successfully pulled from Discord.
+    fetched: usize,
+    /// Messages that fit in the transcript (≤ `fetched`; differs when the
+    /// attachment-size limit truncates).
+    written: usize,
+    /// We stopped fetching because we hit the message cap and the thread still
+    /// has more messages we did not include.
+    hit_cap: bool,
+    /// Transcript was cut to keep the attachment under Discord's size limit.
+    byte_truncated: bool,
+}
+
+/// Filter mode for export_channel_messages.
+enum ExportFilter {
+    /// Fetch all messages (newest-first via `before`), capped at THREAD_EXPORT_MESSAGE_LIMIT.
+    All,
+    /// Fetch the most recent N messages (newest-first via `before`).
+    Limit(usize),
+    /// Fetch messages after a synthetic snowflake (newest-first via `before`, with boundary filtering).
+    After(MessageId),
+}
+
+/// Discord epoch: 2015-01-01T00:00:00Z in milliseconds.
+const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+
+/// Convert a UTC timestamp (in milliseconds since Unix epoch) to a synthetic
+/// Discord snowflake suitable for use as an `after` cursor.
+fn timestamp_ms_to_snowflake(timestamp_ms: u64) -> MessageId {
+    let discord_ms = timestamp_ms.saturating_sub(DISCORD_EPOCH_MS);
+    // Snowflake IDs use NonZeroU64 in serenity; ensure at least 1.
+    MessageId::new((discord_ms << 22).max(1))
+}
+
+async fn export_channel_messages(
+    http: &Http,
+    channel_id: ChannelId,
+    channel_name: &str,
+    attachment_size_limit: u32,
+    filter: ExportFilter,
+) -> anyhow::Result<ExportResult> {
+    let cap = match &filter {
+        ExportFilter::Limit(n) => *n,
+        _ => THREAD_EXPORT_MESSAGE_LIMIT,
+    };
+
+    let mut messages = Vec::new();
+    let mut hit_cap = false;
+
+    match &filter {
+        ExportFilter::All | ExportFilter::Limit(_) => {
+            // Fetch newest-first using `before` pagination, then reverse.
+            let mut before = None;
+            loop {
+                if messages.len() >= cap {
+                    hit_cap = true;
+                    break;
+                }
+                let remaining = cap - messages.len();
+                let limit = remaining.min(100) as u8;
+                let mut request = GetMessages::new().limit(limit);
+                if let Some(before_id) = before {
+                    request = request.before(before_id);
+                }
+                let batch = channel_id.messages(http, request).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                before = batch.last().map(|m| m.id);
+                let batch_len = batch.len();
+                messages.extend(batch);
+                if batch_len < limit as usize {
+                    break;
+                }
+            }
+            // Probe to confirm we actually left messages behind.
+            if hit_cap {
+                let probe = GetMessages::new().limit(1);
+                let probe = if let Some(before_id) = before {
+                    probe.before(before_id)
+                } else {
+                    probe
+                };
+                if matches!(channel_id.messages(http, probe).await, Ok(b) if b.is_empty()) {
+                    hit_cap = false;
+                }
+            }
+            messages.reverse();
+        }
+        ExportFilter::After(after_id) => {
+            // Fetch newest-first using `before` pagination, stop when we hit
+            // messages at or before the filter boundary. This ensures that when
+            // the cap is reached, we keep the *newest* messages in the window.
+            let mut before = None;
+            loop {
+                if messages.len() >= cap {
+                    hit_cap = true;
+                    break;
+                }
+                let remaining = cap - messages.len();
+                let limit = remaining.min(100) as u8;
+                let mut request = GetMessages::new().limit(limit);
+                if let Some(before_id) = before {
+                    request = request.before(before_id);
+                }
+                let batch = channel_id.messages(http, request).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                before = batch.last().map(|m| m.id);
+                let batch_len = batch.len();
+                // Filter out messages at or before the boundary.
+                let filtered: Vec<_> = batch.into_iter().filter(|m| m.id > *after_id).collect();
+                let hit_boundary = filtered.len() < batch_len;
+                messages.extend(filtered);
+                if hit_boundary {
+                    // We've reached the time boundary; no need to fetch older.
+                    break;
+                }
+                if batch_len < limit as usize {
+                    break;
+                }
+            }
+            // Probe only if we stopped due to cap (not boundary).
+            if hit_cap {
+                let probe = GetMessages::new().limit(1);
+                let probe = if let Some(before_id) = before {
+                    probe.before(before_id)
+                } else {
+                    probe
+                };
+                if let Ok(batch) = channel_id.messages(http, probe).await {
+                    // If the next message is beyond our filter boundary,
+                    // we didn't actually leave relevant messages behind.
+                    let has_more_in_window = batch.iter().any(|m| m.id > *after_id);
+                    if !has_more_in_window {
+                        hit_cap = false;
+                    }
+                }
+            }
+            messages.reverse();
+        }
+    }
+
+    let filename = export_filename(channel_id, channel_name);
+    if attachment_size_limit < 2048 {
+        tracing::warn!(attachment_size_limit, "attachment_size_limit is very small; export will likely be truncated");
+    }
+    let max_bytes = usize::try_from(attachment_size_limit)
+        .unwrap_or(8 * 1024 * 1024)
+        .saturating_sub(1024)
+        .max(1024);
+    let (transcript, written, byte_truncated) =
+        format_thread_export(channel_id, channel_name, &messages, max_bytes);
+    let fetched = messages.len();
+
+    Ok(ExportResult {
+        filename,
+        transcript,
+        fetched,
+        written,
+        hit_cap,
+        byte_truncated,
+    })
+}
+
+fn format_thread_export(
+    channel_id: ChannelId,
+    channel_name: &str,
+    messages: &[Message],
+    max_bytes: usize,
+) -> (String, usize, bool) {
+    let header = format!(
+        "Discord thread export\nChannel: {channel_name} ({channel_id})\nMessages: {}\n\n",
+        messages.len()
+    );
+    let entries: Vec<String> = messages.iter().map(format_export_message).collect();
+    assemble_export(&header, &entries, max_bytes)
+}
+
+/// Build the transcript body from a pre-rendered header and a list of
+/// already-formatted message entries, honouring `max_bytes`.
+///
+/// Returns `(transcript, written, truncated)` where `written` is the number of
+/// entries actually included. Split out from `format_thread_export` so the
+/// truncation boundary logic can be unit-tested without constructing real
+/// `serenity::model::channel::Message` values.
+fn assemble_export(header: &str, entries: &[String], max_bytes: usize) -> (String, usize, bool) {
+    let mut out = String::from(header);
+    let mut written = 0;
+    let mut truncated = false;
+
+    for entry in entries {
+        if out.len() + entry.len() > max_bytes {
+            truncated = true;
+            break;
+        }
+        out.push_str(entry);
+        written += 1;
+    }
+
+    if truncated {
+        let note = "\n[Export truncated to fit Discord attachment size limit]\n";
+        let room = max_bytes.saturating_sub(out.len());
+        if room >= note.len() {
+            out.push_str(note);
+        }
+    }
+
+    (out, written, truncated)
+}
+
+fn format_export_message(msg: &Message) -> String {
+    let bot_marker = if msg.author.bot { " [bot]" } else { "" };
+    let mut out = format!(
+        "[{}] {}{} ({})\n",
+        msg.timestamp,
+        msg.author.name,
+        bot_marker,
+        msg.author.id
+    );
+
+    if msg.content.is_empty() {
+        out.push_str("(no text)\n");
+    } else {
+        out.push_str(&msg.content);
+        out.push('\n');
+    }
+
+    for attachment in &msg.attachments {
+        let mime = attachment.content_type.as_deref().unwrap_or("unknown");
+        out.push_str(&format!(
+            "[attachment] {} ({} bytes, {}): {}\n",
+            attachment.filename, attachment.size, mime, attachment.url
+        ));
+    }
+
+    out.push('\n');
+    out
+}
+
+fn export_filename(channel_id: ChannelId, channel_name: &str) -> String {
+    let safe_name = sanitize_filename_component(channel_name);
+    format!("discord-thread-{safe_name}-{channel_id}.txt")
+}
+
+/// Reduce a free-form Discord channel/thread name to a safe ASCII filename
+/// fragment.
+///
+/// Non-ASCII characters are dropped silently — a purely-Chinese thread name
+/// like "扈三娘的房間" yields a date-based fallback (e.g. `"20260512"`).
+/// The caller appends the channel ID, which already guarantees uniqueness,
+/// and an ASCII fragment plays nicer with downstream tools (mail attachments,
+/// S3 keys, browser save-as dialogs). The 64-byte cap leaves room for the
+/// `discord-thread-` prefix and the channel-ID suffix within typical
+/// filesystem limits.
+fn sanitize_filename_component(input: &str) -> String {
+    let mut safe = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            safe.push(ch);
+        } else if ch.is_whitespace() || matches!(ch, '.' | '/') {
+            safe.push('-');
+        }
+    }
+    let safe = safe.trim_matches('-');
+    if safe.is_empty() {
+        // Use current date as a human-friendly fallback when the thread name
+        // is entirely non-ASCII.
+        chrono::Utc::now().format("%Y%m%d").to_string()
+    } else {
+        safe.chars().take(64).collect()
+    }
+}
+
 async fn get_or_create_thread(
     ctx: &Context,
     adapter: &Arc<dyn ChatAdapter>,
@@ -1322,7 +2054,9 @@ fn resolve_mentions(content: &str, bot_id: UserId, allowed_role_ids: &HashSet<u6
     let out = if allowed_role_ids.is_empty() {
         out
     } else {
-        allowed_role_ids.iter().fold(out, |s, id| s.replace(&format!("<@&{}>", id), ""))
+        allowed_role_ids
+            .iter()
+            .fold(out, |s, id| s.replace(&format!("<@&{}>", id), ""))
     };
     // 3. Other user mentions: keep <@UID> as-is so the LLM can mention back
     // 4. Fallback: replace remaining role mentions only (user mentions are preserved)
@@ -1370,6 +2104,7 @@ fn build_sender_context(
     is_bot: bool,
     timestamp: &str,
     message_id: &str,
+    receiver_id: &str,
 ) -> SenderContext {
     SenderContext {
         schema: "openab.sender.v1".into(),
@@ -1382,6 +2117,7 @@ fn build_sender_context(
         is_bot,
         timestamp: Some(timestamp.to_string()),
         message_id: Some(message_id.to_string()),
+        receiver_id: Some(receiver_id.to_string()),
     }
 }
 
@@ -1480,10 +2216,26 @@ fn should_process_user_message(
     }
 }
 
+/// Returns true if any bot message in `messages` contains a turn limit warning.
+/// Used to dedup `WarnAndStop` across multiple bot processes sharing a thread. (#530)
+/// Note: this is best-effort — a narrow race window exists where two bots fetch
+/// simultaneously and both see no warning, resulting in a duplicate. For most
+/// deployments this is acceptable; strict once-only semantics would require
+/// shared state (e.g. gateway-owned emission or distributed lock).
+///
+/// Accepts `(is_bot, content)` pairs so the logic can be unit-tested without
+/// constructing `serenity::model::channel::Message` values (see existing test
+/// boundary comment at `format_thread_export`).
+fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
+    messages
+        .iter()
+        .any(|(is_bot, content)| *is_bot && content.contains(BOT_TURN_LIMIT_WARNING_PREFIX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT};
+    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
 
     // --- resolve_mentions tests ---
 
@@ -1592,6 +2344,152 @@ mod tests {
         assert!(!is_thread_already_exists_error(&err));
         let err = anyhow::anyhow!("rate limit exceeded");
         assert!(!is_thread_already_exists_error(&err));
+    }
+
+    // --- thread export helpers ---
+
+    #[test]
+    fn sanitize_filename_component_keeps_safe_ascii() {
+        assert_eq!(
+            sanitize_filename_component("release notes_v2"),
+            "release-notes_v2"
+        );
+    }
+
+    #[test]
+    fn sanitize_filename_component_falls_back_for_empty_result() {
+        let result = sanitize_filename_component("///...");
+        // Fallback is a YYYYMMDD date string
+        assert_eq!(result.len(), 8);
+        assert!(result.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    // --- assemble_export ---
+    // Split out from format_thread_export so we can test the truncation
+    // boundary without constructing serenity::model::channel::Message values.
+
+    #[test]
+    fn assemble_export_empty_entries_returns_header_only() {
+        let (out, written, truncated) = assemble_export("HDR\n", &[], 1024);
+        assert_eq!(out, "HDR\n");
+        assert_eq!(written, 0);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn assemble_export_single_oversized_entry_writes_zero_and_marks_truncated() {
+        let entries = vec!["x".repeat(200)];
+        let (out, written, truncated) = assemble_export("h\n", &entries, 50);
+        assert_eq!(written, 0);
+        assert!(truncated);
+        // Footer needs ~56 bytes; max_bytes 50 leaves ≤48 of room, so it is
+        // intentionally omitted (it can't be appended without exceeding the
+        // limit). The header is still present.
+        assert!(out.starts_with("h\n"));
+        assert!(!out.contains("xx"));
+    }
+
+    #[test]
+    fn assemble_export_entry_at_exact_boundary_is_included() {
+        // header(2) + entry(3) == max_bytes(5); the strict-greater check
+        // keeps the entry in.
+        let (out, written, truncated) = assemble_export("h\n", &["abc".to_string()], 5);
+        assert_eq!(written, 1);
+        assert!(!truncated);
+        assert_eq!(out, "h\nabc");
+    }
+
+    #[test]
+    fn assemble_export_entry_one_byte_over_boundary_is_excluded() {
+        // header(2) + entry(4) == 6 > max_bytes(5); entry is dropped.
+        let (out, written, truncated) = assemble_export("h\n", &["abcd".to_string()], 5);
+        assert_eq!(written, 0);
+        assert!(truncated);
+        assert!(out.starts_with("h\n"));
+        assert!(!out.contains("abcd"));
+    }
+
+    #[test]
+    fn assemble_export_appends_footer_when_room_remains() {
+        // First two short entries fit; the long third entry would overflow,
+        // and the remaining headroom is enough for the truncation footer.
+        let entries = vec!["a\n".to_string(), "b\n".to_string(), "c".repeat(500)];
+        let (out, written, truncated) = assemble_export("h\n", &entries, 200);
+        assert_eq!(written, 2);
+        assert!(truncated);
+        assert!(out.contains("[Export truncated"));
+    }
+
+    // --- snowflake conversion ---
+
+    #[test]
+    fn timestamp_ms_to_snowflake_known_value() {
+        // 2026-05-10 00:00:00 UTC = 1778572800000 ms since Unix epoch
+        // Discord ms = 1778572800000 - 1420070400000 = 358502400000
+        // Snowflake = 358502400000 << 22 = 1503238553600000000 (approx)
+        let ts_ms: u64 = 1_778_572_800_000;
+        let snowflake = timestamp_ms_to_snowflake(ts_ms);
+        // Verify round-trip: extract timestamp back from snowflake
+        let extracted_ms = (snowflake.get() >> 22) + DISCORD_EPOCH_MS;
+        assert_eq!(extracted_ms, ts_ms);
+    }
+
+    #[test]
+    fn timestamp_ms_to_snowflake_at_discord_epoch_is_one() {
+        // At exactly the Discord epoch, discord_ms=0, shifted=0, clamped to 1
+        let snowflake = timestamp_ms_to_snowflake(DISCORD_EPOCH_MS);
+        assert_eq!(snowflake.get(), 1);
+    }
+
+    #[test]
+    fn timestamp_ms_to_snowflake_before_epoch_saturates() {
+        // Timestamp before Discord epoch should saturate to 1
+        let snowflake = timestamp_ms_to_snowflake(1_000_000_000_000);
+        assert_eq!(snowflake.get(), 1);
+    }
+
+    // --- ExportFilter cap logic ---
+
+    #[test]
+    fn export_filter_default_cap_is_100() {
+        // Default (no params) uses Limit(100)
+        let filter = ExportFilter::Limit(100);
+        let cap = match &filter {
+            ExportFilter::Limit(n) => *n,
+            _ => THREAD_EXPORT_MESSAGE_LIMIT,
+        };
+        assert_eq!(cap, 100);
+    }
+
+    #[test]
+    fn export_filter_all_cap_is_5000() {
+        let filter = ExportFilter::All;
+        let cap = match &filter {
+            ExportFilter::Limit(n) => *n,
+            _ => THREAD_EXPORT_MESSAGE_LIMIT,
+        };
+        assert_eq!(cap, THREAD_EXPORT_MESSAGE_LIMIT);
+        assert_eq!(cap, 5000);
+    }
+
+    #[test]
+    fn export_filter_limit_uses_custom_cap() {
+        let filter = ExportFilter::Limit(250);
+        let cap = match &filter {
+            ExportFilter::Limit(n) => *n,
+            _ => THREAD_EXPORT_MESSAGE_LIMIT,
+        };
+        assert_eq!(cap, 250);
+    }
+
+    #[test]
+    fn export_filter_after_uses_global_cap() {
+        let filter = ExportFilter::After(MessageId::new(123456789));
+        let cap = match &filter {
+            ExportFilter::Limit(n) => *n,
+            _ => THREAD_EXPORT_MESSAGE_LIMIT,
+        };
+        assert_eq!(cap, THREAD_EXPORT_MESSAGE_LIMIT);
     }
 
     // --- should_process_user_message tests (GIVEN/WHEN/THEN) ---
@@ -1758,12 +2656,14 @@ mod tests {
             false,
             "2026-05-01T00:00:00Z",
             "msg123",
+            "bot99",
         );
         assert_eq!(ctx.channel_id, "parent_ch");
         assert_eq!(ctx.thread_id, Some("thread_ch".to_string()));
         assert_eq!(ctx.channel, "discord");
         assert_eq!(ctx.sender_id, "user1");
         assert!(!ctx.is_bot);
+        assert_eq!(ctx.receiver_id, Some("bot99".to_string()));
     }
 
     /// Non-thread message: channel_id = message channel, thread_id = None.
@@ -1778,6 +2678,7 @@ mod tests {
             false,
             "2026-05-01T00:00:00Z",
             "msg456",
+            "bot99",
         );
         assert_eq!(ctx.channel_id, "main_ch");
         assert_eq!(ctx.thread_id, None);
@@ -1795,6 +2696,7 @@ mod tests {
             true,
             "2026-05-01T00:00:00Z",
             "msg789",
+            "bot99",
         );
         assert!(ctx.is_bot);
         assert_eq!(ctx.channel_id, "parent");
@@ -2117,5 +3019,29 @@ mod tests {
     #[test]
     fn normal_channel_creates_thread() {
         assert!(!should_skip_thread_creation(false, false));
+    }
+
+    // --- WarnAndStop dedup tests (#530) ---
+
+    #[test]
+    fn dedup_detects_existing_bot_warning() {
+        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        assert!(turn_limit_warning_present(&[(true, &msg)]));
+    }
+
+    #[test]
+    fn dedup_ignores_human_warning_text() {
+        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        assert!(!turn_limit_warning_present(&[(false, &msg)]));
+    }
+
+    #[test]
+    fn dedup_returns_false_when_no_warning() {
+        assert!(!turn_limit_warning_present(&[(true, "hello"), (false, "world")]));
+    }
+
+    #[test]
+    fn dedup_returns_false_for_empty_messages() {
+        assert!(!turn_limit_warning_present(&[]));
     }
 }

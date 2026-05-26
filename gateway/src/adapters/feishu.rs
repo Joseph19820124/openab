@@ -106,6 +106,9 @@ pub struct FeishuConfig {
     /// tracking entirely — all messages will require @mention.
     /// Converted from `FEISHU_SESSION_TTL_HOURS` (user-facing, in hours) to seconds internally.
     pub session_ttl_secs: u64,
+    /// Override the API base URL. Used in tests to point at a mock server.
+    /// Always None in production (not read from env).
+    pub api_base_override: Option<String>,
 }
 
 impl FeishuConfig {
@@ -192,11 +195,15 @@ impl FeishuConfig {
             dedupe_ttl_secs,
             message_limit,
             session_ttl_secs,
+            api_base_override: None,
         })
     }
 
     /// API base URL for the configured domain.
     pub fn api_base(&self) -> String {
+        if let Some(ref base) = self.api_base_override {
+            return base.clone();
+        }
         if self.domain == "lark" {
             "https://open.larksuite.com".into()
         } else {
@@ -226,6 +233,8 @@ mod event_types {
         pub header: Option<FeishuEventHeader>,
         pub event: Option<FeishuEventBody>,
         pub challenge: Option<String>,
+        // Parsed by serde, not consumed in current code paths.
+        #[allow(dead_code)]
         #[serde(rename = "type")]
         pub event_type_field: Option<String>,
     }
@@ -233,6 +242,8 @@ mod event_types {
     #[derive(Debug, Deserialize)]
     pub struct FeishuEventHeader {
         pub event_id: Option<String>,
+        // Parsed by serde, not consumed in current code paths.
+        #[allow(dead_code)]
         pub event_type: Option<String>,
     }
 
@@ -269,6 +280,8 @@ mod event_types {
     pub struct FeishuMention {
         pub key: Option<String>,
         pub id: Option<FeishuMentionId>,
+        // Parsed by serde, not consumed in current code paths.
+        #[allow(dead_code)]
         pub name: Option<String>,
     }
 
@@ -297,7 +310,7 @@ mod event_types {
         let sender = event.sender.as_ref()?;
 
         let msg_type = msg.message_type.as_deref().unwrap_or("text");
-        if !matches!(msg_type, "text" | "image" | "file" | "post") {
+        if !matches!(msg_type, "text" | "image" | "file" | "post" | "audio") {
             return None;
         }
         // Skip bot messages with explicit sender_type
@@ -385,6 +398,17 @@ mod event_types {
                 }];
                 (String::new(), mentions.1, refs)
             }
+            "audio" => {
+                let file_key = content_json.get("file_key")?.as_str()?;
+                let mentions = extract_mentions(
+                    "", msg.mentions.as_deref().unwrap_or(&[]), bot_open_id,
+                );
+                let refs = vec![MediaRef::Audio {
+                    message_id: message_id.to_string(),
+                    file_key: file_key.to_string(),
+                }];
+                (String::new(), mentions.1, refs)
+            }
             "post" => {
                 // Rich text: content is {"title":"...","content":[[{tag,text,...},{tag,image_key,...}]]}
                 let mut texts = Vec::new();
@@ -459,13 +483,15 @@ mod event_types {
         // Bypass: if bot has previously replied in this thread (participated),
         // no @mention needed (like Discord's "involved" mode).
         let in_thread = thread_id.is_some();
-        if channel_type == "group" && !is_bot_sender && config.require_mention {
-            if !(in_thread && bypass_mention_gating) {
-                if let Some(bot_id) = bot_open_id {
-                    let bot_mentioned = mention_ids.iter().any(|id| id == bot_id);
-                    if !bot_mentioned {
-                        return None;
-                    }
+        if channel_type == "group"
+            && !is_bot_sender
+            && config.require_mention
+            && !(in_thread && bypass_mention_gating)
+        {
+            if let Some(bot_id) = bot_open_id {
+                let bot_mentioned = mention_ids.iter().any(|id| id == bot_id);
+                if !bot_mentioned {
+                    return None;
                 }
             }
         }
@@ -843,6 +869,7 @@ pub async fn start_websocket(
 }
 
 /// Single WebSocket connection lifecycle.
+#[allow(clippy::too_many_arguments)]
 async fn ws_connect_loop(
     token_cache: &Arc<FeishuTokenCache>,
     bot_open_id_store: &Arc<RwLock<Option<String>>>,
@@ -912,7 +939,7 @@ async fn ws_connect_loop(
                                     ack.payload = Some(b"{\"code\":200}".to_vec());
                                     let ack_bytes = ack.encode_to_vec();
                                     let _ = ws_tx.send(
-                                        tokio_tungstenite::tungstenite::Message::Binary(ack_bytes.into())
+                                        tokio_tungstenite::tungstenite::Message::Binary(ack_bytes)
                                     ).await;
                                 }
                             }
@@ -933,6 +960,7 @@ async fn ws_connect_loop(
 }
 
 /// Process a single WebSocket text message.
+#[allow(clippy::too_many_arguments)]
 async fn handle_ws_message(
     text: &str,
     bot_open_id_store: &Arc<RwLock<Option<String>>>,
@@ -1037,6 +1065,9 @@ async fn handle_ws_message(
                         }
                         MediaRef::File { message_id, file_key, file_name } => {
                             download_feishu_file(client, &api_base, &token, message_id, file_key, file_name).await
+                        }
+                        MediaRef::Audio { message_id, file_key } => {
+                            download_feishu_audio(client, &api_base, &token, message_id, file_key).await
                         }
                     };
                     if let Some(att) = attachment {
@@ -1157,8 +1188,8 @@ fn markdown_to_post(md: &str) -> serde_json::Value {
         let line = raw_lines[li];
         // Detect fenced code block
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            let lang = trimmed[3..].trim().to_string();
+        if let Some(after_fence) = trimmed.strip_prefix("```") {
+            let lang = after_fence.trim().to_string();
             let mut code = String::new();
             li += 1;
             while li < raw_lines.len() {
@@ -1231,9 +1262,7 @@ fn parse_inline(line: &str) -> Vec<serde_json::Value> {
                     }
                     if close_ticks == ticks {
                         // Found matching close — content between is literal
-                        for j in i..end {
-                            buf.push(chars[j]);
-                        }
+                        buf.extend(chars[i..end].iter().copied());
                         i = end + close_ticks;
                         break 'outer;
                     }
@@ -1244,9 +1273,7 @@ fn parse_inline(line: &str) -> Vec<serde_json::Value> {
             }
             if end >= len {
                 // No matching close — treat backticks as literal
-                for j in i..len {
-                    buf.push(chars[j]);
-                }
+                buf.extend(chars[i..len].iter().copied());
                 i = len;
             }
             continue;
@@ -1271,9 +1298,7 @@ fn parse_inline(line: &str) -> Vec<serde_json::Value> {
                     }
                     if close_run == run {
                         // Found matching close — strip both, keep inner text
-                        for j in after..scan {
-                            buf.push(chars[j]);
-                        }
+                        buf.extend(chars[after..scan].iter().copied());
                         i = scan + close_run;
                         found_close = true;
                         break;
@@ -1343,6 +1368,7 @@ fn try_parse_link(chars: &[char], start: usize) -> Option<(String, String, usize
 pub enum MediaRef {
     Image { message_id: String, image_key: String },
     File { message_id: String, file_key: String, file_name: String },
+    Audio { message_id: String, file_key: String },
 }
 
 const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
@@ -1423,15 +1449,15 @@ pub async fn download_feishu_image(
             return None;
         }
     };
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(&compressed);
+    let path = crate::store::store_media(&compressed).await?;
     let ext = if mime == "image/gif" { "gif" } else { "jpg" };
     Some(crate::schema::Attachment {
         attachment_type: "image".into(),
         filename: format!("{}.{}", image_key, ext),
         mime_type: mime,
-        data,
+        data: String::new(),
         size: compressed.len() as u64,
+        path: Some(path),
     })
 }
 
@@ -1485,15 +1511,71 @@ pub async fn download_feishu_file(
         tracing::warn!(file_name, size = bytes.len(), "feishu file exceeds 512KB limit");
         return None;
     }
-    let text = String::from_utf8_lossy(&bytes);
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let path = crate::store::store_media(&bytes).await?;
     Some(crate::schema::Attachment {
         attachment_type: "text_file".into(),
         filename: file_name.to_string(),
         mime_type: "text/plain".into(),
-        data,
+        data: String::new(),
         size: bytes.len() as u64,
+        path: Some(path),
+    })
+}
+
+const AUDIO_MAX_DOWNLOAD: u64 = 25 * 1024 * 1024; // 25 MB (Whisper API limit)
+
+/// Download a Feishu audio message by message_id + file_key → base64 Attachment.
+pub async fn download_feishu_audio(
+    client: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+    message_id: &str,
+    file_key: &str,
+) -> Option<crate::schema::Attachment> {
+    use urlencoding::encode;
+    let url = format!(
+        "{}/open-apis/im/v1/messages/{}/resources/{}?type=file",
+        api_base, encode(message_id), encode(file_key)
+    );
+    let resp = match client.get(&url).bearer_auth(token).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(file_key, error = %e, "feishu audio download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(file_key, status = %resp.status(), "feishu audio download failed");
+        return None;
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("audio/ogg")
+        .to_string();
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > AUDIO_MAX_DOWNLOAD {
+                tracing::warn!(file_key, size, "feishu audio exceeds 25MB limit");
+                return None;
+            }
+        }
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() as u64 > AUDIO_MAX_DOWNLOAD {
+        tracing::warn!(file_key, size = bytes.len(), "feishu audio exceeds 25MB limit");
+        return None;
+    }
+    tracing::debug!(file_key, size = bytes.len(), "feishu audio downloaded");
+    let path = crate::store::store_media(&bytes).await?;
+    Some(crate::schema::Attachment {
+        attachment_type: "audio".into(),
+        filename: format!("{}.ogg", file_key),
+        mime_type: content_type,
+        data: String::new(),
+        size: bytes.len() as u64,
+        path: Some(path),
     })
 }
 
@@ -1816,7 +1898,9 @@ fn detect_and_mark_multibot(
                 thread_id_for_check
                     .map(|tid| {
                         let cache = multibot_threads.lock().unwrap_or_else(|e| e.into_inner());
-                        !cache.get(tid).is_some_and(|ts| ts.elapsed().as_secs() < config.session_ttl_secs)
+                        cache
+                            .get(tid)
+                            .is_none_or(|ts| ts.elapsed().as_secs() >= config.session_ttl_secs)
                     })
                     .unwrap_or(true)
             }
@@ -1904,6 +1988,9 @@ pub async fn handle_reply(
     let api_base = adapter.config.api_base();
     let text = &reply.content.text;
     let limit = adapter.config.message_limit;
+    // quote_message_id (agent-controlled reply-to) takes priority over thread_id
+    let reply_target = reply.quote_message_id.as_deref()
+        .or(reply.channel.thread_id.as_deref());
     let thread_id = reply.channel.thread_id.as_deref();
 
     // Split long messages; store sent message_ids in dedupe to prevent
@@ -1911,7 +1998,15 @@ pub async fn handle_reply(
     // Use post (rich text) format for markdown rendering.
     // When in a thread (thread_id present), use reply API to stay in the same thread.
     if text.len() <= limit {
-        match send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, text).await {
+        let result = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, reply_target, text).await;
+        // Fallback: if quote_message_id caused failure, retry without it
+        let result = if result.is_none() && reply.quote_message_id.is_some() {
+            tracing::warn!(quote_message_id = ?reply.quote_message_id, channel_id = %reply.channel.id, "reply-to failed, falling back to plain send");
+            send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, text).await
+        } else {
+            result
+        };
+        match result {
             Some(msg_id) => {
                 adapter.dedupe.is_duplicate(&msg_id);
                 // Record thread participation for mention bypass
@@ -1953,9 +2048,19 @@ pub async fn handle_reply(
     } else {
         let mut sent_any = false;
         for chunk in split_text(text, limit) {
-            if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, chunk).await {
+            if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, reply_target, chunk).await {
                 adapter.dedupe.is_duplicate(&msg_id);
                 sent_any = true;
+            }
+        }
+        // Fallback: if quote_message_id caused all chunks to fail, retry without it
+        if !sent_any && reply.quote_message_id.is_some() {
+            tracing::warn!(quote_message_id = ?reply.quote_message_id, channel_id = %reply.channel.id, "chunked reply-to failed, falling back to plain send");
+            for chunk in split_text(text, limit) {
+                if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, chunk).await {
+                    adapter.dedupe.is_duplicate(&msg_id);
+                    sent_any = true;
+                }
             }
         }
         if sent_any {
@@ -2263,6 +2368,9 @@ pub async fn webhook(
                             MediaRef::File { message_id, file_key, file_name } => {
                                 download_feishu_file(&feishu.client, &api_base, &token, message_id, file_key, file_name).await
                             }
+                            MediaRef::Audio { message_id, file_key } => {
+                                download_feishu_audio(&feishu.client, &api_base, &token, message_id, file_key).await
+                            }
                         };
                         if let Some(att) = attachment {
                             gateway_event.content.attachments.push(att);
@@ -2318,6 +2426,7 @@ mod tests {
             dedupe_ttl_secs: 300,
             message_limit: 4000,
             session_ttl_secs: 86400,
+            api_base_override: None,
         }
     }
 
@@ -2941,5 +3050,149 @@ mod tests {
         // Even with bypass_mention_gating=true, Mentions mode never bypasses
         // (caller would pass false because Mentions mode always returns false)
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
+    }
+
+    #[test]
+    fn quote_message_id_takes_priority_over_thread_id() {
+        use crate::schema::{GatewayReply, ReplyChannel, Content};
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt_123".into(),
+            platform: "feishu".into(),
+            channel: ReplyChannel {
+                id: "chat_123".into(),
+                thread_id: Some("om_root".into()),
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: "hello".into(),
+                attachments: vec![],
+            },
+            command: None,
+            request_id: None,
+            quote_message_id: Some("om_specific".into()),
+        };
+        // quote_message_id should take priority
+        let reply_target = reply.quote_message_id.as_deref()
+            .or(reply.channel.thread_id.as_deref());
+        assert_eq!(reply_target, Some("om_specific"));
+    }
+
+    #[test]
+    fn reply_target_falls_back_to_thread_id_when_no_quote() {
+        use crate::schema::{GatewayReply, ReplyChannel, Content};
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt_123".into(),
+            platform: "feishu".into(),
+            channel: ReplyChannel {
+                id: "chat_123".into(),
+                thread_id: Some("om_root".into()),
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: "hello".into(),
+                attachments: vec![],
+            },
+            command: None,
+            request_id: None,
+            quote_message_id: None,
+        };
+        let reply_target = reply.quote_message_id.as_deref()
+            .or(reply.channel.thread_id.as_deref());
+        assert_eq!(reply_target, Some("om_root"));
+    }
+
+    #[test]
+    fn reply_target_is_none_when_both_absent() {
+        use crate::schema::{GatewayReply, ReplyChannel, Content};
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt_123".into(),
+            platform: "feishu".into(),
+            channel: ReplyChannel {
+                id: "chat_123".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: "hello".into(),
+                attachments: vec![],
+            },
+            command: None,
+            request_id: None,
+            quote_message_id: None,
+        };
+        let reply_target = reply.quote_message_id.as_deref()
+            .or(reply.channel.thread_id.as_deref());
+        assert_eq!(reply_target, None);
+    }
+
+    #[tokio::test]
+    async fn quote_message_id_fallback_on_reply_failure() {
+        // Tests the actual handle_reply fallback path: when quote_message_id
+        // is set and the reply API fails, handle_reply retries as plain send.
+        let server = MockServer::start().await;
+
+        // Token endpoint
+        Mock::given(method("POST"))
+            .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-test",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        // Reply API returns 400 (invalid quote_message_id)
+        Mock::given(method("POST"))
+            .and(path("/open-apis/im/v1/messages/om_invalid/reply"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid message_id"))
+            .expect(1)
+            .named("reply_api_fail")
+            .mount(&server)
+            .await;
+
+        // Plain send endpoint succeeds (fallback path)
+        Mock::given(method("POST"))
+            .and(path("/open-apis/im/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {"message_id": "om_fallback_ok"}
+            })))
+            .expect(1)
+            .named("plain_send_fallback")
+            .mount(&server)
+            .await;
+
+        let mut config = test_config();
+        config.api_base_override = Some(server.uri());
+        let adapter = FeishuAdapter::new(config);
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+
+        let reply = crate::schema::GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt_123".into(),
+            platform: "feishu".into(),
+            channel: crate::schema::ReplyChannel {
+                id: "oc_chat1".into(),
+                thread_id: None,
+            },
+            content: crate::schema::Content {
+                content_type: "text".into(),
+                text: "hello from fallback test".into(),
+                attachments: vec![],
+            },
+            command: None,
+            request_id: None,
+            quote_message_id: Some("om_invalid".into()),
+        };
+
+        handle_reply(&reply, &adapter, &event_tx).await;
+        // wiremock expect(1) on both mocks verifies:
+        // 1. Reply API was called (and failed)
+        // 2. Plain send was called (fallback triggered by quote_message_id.is_some() guard)
     }
 }
