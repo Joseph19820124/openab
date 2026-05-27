@@ -1,5 +1,5 @@
 use crate::agent::Agent;
-use crate::llm::AnthropicProvider;
+use crate::llm::{AnthropicProvider, GeminiProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -132,23 +132,30 @@ impl AcpServer {
                 Ok(p) => Box::new(p),
                 Err(e) => return self.error_response(id, -32000, &e),
             },
+            "gemini" | "google" => match GeminiProvider::from_env() {
+                Ok(p) => Box::new(p),
+                Err(e) => return self.error_response(id, -32000, &e),
+            },
             "openai" | "codex" => match crate::llm::OpenAiProvider::from_auth_store() {
                 Ok(p) => Box::new(p),
                 Err(e) => return self.error_response(id, -32000, &e),
             },
             _ => {
-                // Auto-detect: try API key first, then OAuth token
+                // Auto-detect order: ANTHROPIC_API_KEY → GEMINI_API_KEY → Codex OAuth
                 match AnthropicProvider::from_env() {
                     Ok(p) => Box::new(p),
-                    Err(_) => match crate::llm::OpenAiProvider::from_auth_store() {
+                    Err(_) => match GeminiProvider::from_env() {
                         Ok(p) => Box::new(p),
-                        Err(e) => {
-                            return self.error_response(
-                                id,
-                                -32000,
-                                &format!("No credentials: set ANTHROPIC_API_KEY or run `openab-agent auth codex-oauth`. {e}"),
-                            )
-                        }
+                        Err(_) => match crate::llm::OpenAiProvider::from_auth_store() {
+                            Ok(p) => Box::new(p),
+                            Err(e) => {
+                                return self.error_response(
+                                    id,
+                                    -32000,
+                                    &format!("No credentials: set ANTHROPIC_API_KEY, GEMINI_API_KEY, or run `openab-agent auth codex-oauth`. {e}"),
+                                )
+                            }
+                        },
                     },
                 }
             }

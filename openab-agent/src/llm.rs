@@ -2,7 +2,9 @@ use anyhow::{anyhow, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::pin::Pin;
+use uuid::Uuid;
 
 /// A message in the conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +241,229 @@ fn parse_anthropic_response(response: &Value) -> Result<Vec<LlmEvent>> {
         .unwrap_or("end_turn");
 
     if stop_reason != "tool_use" {
+        events.push(LlmEvent::Stop);
+    }
+
+    Ok(events)
+}
+
+// === Google Gemini Provider (API key) ===
+//
+// Endpoint: POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key=KEY
+// Differences from Anthropic that this provider hides:
+//   - role values: `user` / `model` (not `assistant`)
+//   - tool calls: `functionCall { name, args }` (no per-call id from server)
+//   - tool results: `functionResponse { name, response }` (matched by name)
+//   - system prompt lives at top-level `systemInstruction`, not inside `messages`
+//   - tools wrapped in `[{ functionDeclarations: [...] }]`
+// We synthesize uuid ids for tool_use blocks since Gemini doesn't return one,
+// and reconstruct the function name when emitting functionResponse by scanning
+// prior tool_use blocks in the same request.
+
+pub struct GeminiProvider {
+    api_key: String,
+    model: String,
+    #[allow(dead_code)]
+    max_tokens: u32,
+    client: reqwest::Client,
+}
+
+impl GeminiProvider {
+    pub fn from_env() -> Result<Self, String> {
+        let api_key = std::env::var("GEMINI_API_KEY")
+            .map_err(|_| "GEMINI_API_KEY not set".to_string())?;
+        if api_key.is_empty() {
+            return Err("GEMINI_API_KEY is empty".to_string());
+        }
+        Ok(Self {
+            api_key,
+            model: std::env::var("OPENAB_AGENT_MODEL")
+                .unwrap_or_else(|_| "gemini-2.5-flash".to_string()),
+            max_tokens: std::env::var("OPENAB_AGENT_MAX_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8192),
+            client: reqwest::Client::new(),
+        })
+    }
+
+    fn build_request_body(&self, system: &str, messages: &[Message], tools: &[ToolDef]) -> Value {
+        // Map tool_use_id -> tool name so we can populate Gemini's functionResponse.name.
+        let mut id_to_name: HashMap<String, String> = HashMap::new();
+        for m in messages {
+            for b in &m.content {
+                if let ContentBlock::ToolUse { id, name, .. } = b {
+                    id_to_name.insert(id.clone(), name.clone());
+                }
+            }
+        }
+
+        let contents: Vec<Value> = messages
+            .iter()
+            .map(|m| {
+                let role = if m.role == "assistant" { "model" } else { "user" };
+                let parts: Vec<Value> = m
+                    .content
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Text { text } => json!({ "text": text }),
+                        ContentBlock::ToolUse { name, input, .. } => json!({
+                            "functionCall": { "name": name, "args": input }
+                        }),
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => {
+                            let name = id_to_name
+                                .get(tool_use_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            let mut response = json!({ "content": content });
+                            if let Some(true) = is_error {
+                                response["error"] = json!(true);
+                            }
+                            json!({
+                                "functionResponse": { "name": name, "response": response }
+                            })
+                        }
+                    })
+                    .collect();
+                json!({ "role": role, "parts": parts })
+            })
+            .collect();
+
+        let mut body = json!({
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": self.max_tokens,
+            }
+        });
+
+        if !system.is_empty() {
+            body["systemInstruction"] = json!({
+                "parts": [{ "text": system }]
+            });
+        }
+
+        if !tools.is_empty() {
+            let function_decls: Vec<Value> = tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": &t.name,
+                        "description": &t.description,
+                        "parameters": &t.input_schema,
+                    })
+                })
+                .collect();
+            body["tools"] = json!([{ "functionDeclarations": function_decls }]);
+        }
+
+        body
+    }
+}
+
+impl LlmProvider for GeminiProvider {
+    fn chat<'a>(
+        &'a self,
+        system: &'a str,
+        messages: &'a [Message],
+        tools: &'a [ToolDef],
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
+        Box::pin(async move {
+            let body = self.build_request_body(system, messages, tools);
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+                self.model
+            );
+            let max_retries = 3u32;
+
+            for attempt in 0..=max_retries {
+                let resp = self
+                    .client
+                    .post(&url)
+                    .query(&[("key", &self.api_key)])
+                    .header("content-type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
+
+                let status = resp.status();
+
+                // Retry on 429 (rate limit) or 503 (service unavailable)
+                if (status.as_u16() == 429 || status.as_u16() == 503) && attempt < max_retries {
+                    let delay = std::time::Duration::from_millis(1000 * 2u64.pow(attempt));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("Gemini API error {status}: {text}"));
+                }
+
+                let response: Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| anyhow!("Failed to parse response: {e}"))?;
+
+                return parse_gemini_response(&response);
+            }
+
+            Err(anyhow!("Gemini API: max retries exceeded"))
+        })
+    }
+}
+
+fn parse_gemini_response(response: &Value) -> Result<Vec<LlmEvent>> {
+    let mut events = Vec::new();
+
+    let candidates = response
+        .get("candidates")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| {
+            let feedback = response
+                .get("promptFeedback")
+                .map(|f| f.to_string())
+                .unwrap_or_default();
+            anyhow!("missing candidates in response. promptFeedback: {feedback}")
+        })?;
+
+    let candidate = candidates
+        .first()
+        .ok_or_else(|| anyhow!("empty candidates array"))?;
+
+    let mut has_tool_call = false;
+
+    if let Some(parts) = candidate
+        .get("content")
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
+    {
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                if !text.is_empty() {
+                    events.push(LlmEvent::Text(text.to_string()));
+                }
+            } else if let Some(fc) = part.get("functionCall") {
+                has_tool_call = true;
+                let name = fc
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let input = fc.get("args").cloned().unwrap_or(json!({}));
+                // Gemini doesn't return a per-call id; synthesize one so the
+                // ToolResult routing in the agent loop has something to match.
+                let id = format!("gem_{}", Uuid::new_v4());
+                events.push(LlmEvent::ToolUse { id, name, input });
+            }
+        }
+    }
+
+    if !has_tool_call {
         events.push(LlmEvent::Stop);
     }
 
@@ -640,5 +865,132 @@ mod tests {
     fn test_parse_openai_empty_choices() {
         let resp = json!({"choices": []});
         assert!(parse_openai_response(&resp).is_err());
+    }
+
+    #[test]
+    fn test_parse_gemini_text_response() {
+        let resp = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "Hello from Gemini"}]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let events = parse_gemini_response(&resp).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], LlmEvent::Text(t) if t == "Hello from Gemini"));
+        assert!(matches!(events[1], LlmEvent::Stop));
+    }
+
+    #[test]
+    fn test_parse_gemini_function_call() {
+        let resp = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "I'll read it."},
+                        {"functionCall": {"name": "read", "args": {"path": "/tmp/x"}}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let events = parse_gemini_response(&resp).unwrap();
+        // Text + ToolUse, no Stop (because tool call pending)
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], LlmEvent::Text(t) if t == "I'll read it."));
+        match &events[1] {
+            LlmEvent::ToolUse { name, input, id } => {
+                assert_eq!(name, "read");
+                assert_eq!(input["path"], "/tmp/x");
+                assert!(id.starts_with("gem_"));
+            }
+            _ => panic!("expected ToolUse event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_gemini_missing_candidates_surfaces_feedback() {
+        let resp = json!({"promptFeedback": {"blockReason": "SAFETY"}});
+        let err = parse_gemini_response(&resp).unwrap_err().to_string();
+        assert!(err.contains("SAFETY"), "got: {err}");
+    }
+
+    #[test]
+    fn test_gemini_build_request_body() {
+        let provider = GeminiProvider {
+            api_key: "test".to_string(),
+            model: "gemini-2.5-flash".to_string(),
+            max_tokens: 4096,
+            client: reqwest::Client::new(),
+        };
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let body = provider.build_request_body("system prompt", &messages, &[]);
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "hello");
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "system prompt");
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 4096);
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn test_gemini_tool_roundtrip() {
+        // Verify ToolUse → functionCall, ToolResult → functionResponse with name lookup
+        let provider = GeminiProvider {
+            api_key: "test".to_string(),
+            model: "gemini-2.5-flash".to_string(),
+            max_tokens: 4096,
+            client: reqwest::Client::new(),
+        };
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "read x.txt".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "gem_abc".to_string(),
+                    name: "read".to_string(),
+                    input: json!({"path": "x.txt"}),
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "gem_abc".to_string(),
+                    content: "file body".to_string(),
+                    is_error: None,
+                }],
+            },
+        ];
+        let tools = vec![ToolDef {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        }];
+        let body = provider.build_request_body("be helpful", &messages, &tools);
+        // Assistant role rewritten to "model"
+        assert_eq!(body["contents"][1]["role"], "model");
+        assert_eq!(body["contents"][1]["parts"][0]["functionCall"]["name"], "read");
+        // ToolResult resolves the function name via the id map
+        assert_eq!(body["contents"][2]["role"], "user");
+        assert_eq!(body["contents"][2]["parts"][0]["functionResponse"]["name"], "read");
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["response"]["content"],
+            "file body"
+        );
+        // Tools wrapped in functionDeclarations
+        assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "read");
     }
 }
