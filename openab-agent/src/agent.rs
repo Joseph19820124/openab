@@ -91,14 +91,25 @@ impl Agent {
 
             let events = self.call_llm().await?;
 
-            let mut tool_calls = Vec::new();
+            let mut tool_calls: Vec<(String, String, serde_json::Value, Option<String>)> =
+                Vec::new();
             let mut text_parts = Vec::new();
 
             for event in &events {
                 match event {
                     LlmEvent::Text(t) => text_parts.push(t.clone()),
-                    LlmEvent::ToolUse { id, name, input } => {
-                        tool_calls.push((id.clone(), name.clone(), input.clone()));
+                    LlmEvent::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature,
+                    } => {
+                        tool_calls.push((
+                            id.clone(),
+                            name.clone(),
+                            input.clone(),
+                            thought_signature.clone(),
+                        ));
                     }
                     LlmEvent::Stop => {}
                     LlmEvent::Error(e) => {
@@ -114,11 +125,12 @@ impl Agent {
                     text: text_parts.join(""),
                 });
             }
-            for (id, name, input) in &tool_calls {
+            for (id, name, input, thought_signature) in &tool_calls {
                 assistant_content.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
+                    thought_signature: thought_signature.clone(),
                 });
             }
 
@@ -135,7 +147,7 @@ impl Agent {
 
             // Execute tool calls and add results
             let mut tool_results: Vec<ContentBlock> = Vec::new();
-            for (id, name, input) in &tool_calls {
+            for (id, name, input, _sig) in &tool_calls {
                 info!("executing tool: {name}");
                 let result = tools::execute_tool(name, input, &self.working_dir).await;
                 match result {
@@ -248,6 +260,7 @@ mod tests {
                 id: "tu_1".to_string(),
                 name: "read".to_string(),
                 input: serde_json::json!({ "path": "test.txt" }),
+                thought_signature: None,
             }],
             // Second call: LLM responds with text
             vec![
@@ -272,6 +285,7 @@ mod tests {
                 id: "tu_1".to_string(),
                 name: "read".to_string(),
                 input: serde_json::json!({ "path": "nonexistent.txt" }),
+                thought_signature: None,
             }],
             // Second call: LLM acknowledges the error
             vec![
@@ -306,12 +320,14 @@ mod tests {
                 id: "tu_1".to_string(),
                 name: "write".to_string(),
                 input: serde_json::json!({ "path": "out.txt", "content": "hello" }),
+                thought_signature: None,
             }],
             // Second call: read it back
             vec![LlmEvent::ToolUse {
                 id: "tu_2".to_string(),
                 name: "read".to_string(),
                 input: serde_json::json!({ "path": "out.txt" }),
+                thought_signature: None,
             }],
             // Third call: done
             vec![

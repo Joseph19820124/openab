@@ -24,6 +24,11 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: Value,
+        /// Opaque token returned by Gemini 3.x for functionCall parts that
+        /// must be echoed back on subsequent requests in the same turn.
+        /// `None` for other providers and for Gemini ≤ 2.5.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
@@ -50,6 +55,8 @@ pub enum LlmEvent {
         id: String,
         name: String,
         input: Value,
+        /// See [`ContentBlock::ToolUse::thought_signature`].
+        thought_signature: Option<String>,
     },
     Stop,
     #[allow(dead_code)]
@@ -103,7 +110,7 @@ impl AnthropicProvider {
                     .iter()
                     .map(|b| match b {
                         ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
-                        ContentBlock::ToolUse { id, name, input } => {
+                        ContentBlock::ToolUse { id, name, input, .. } => {
                             json!({ "type": "tool_use", "id": id, "name": name, "input": input })
                         }
                         ContentBlock::ToolResult {
@@ -229,7 +236,12 @@ fn parse_anthropic_response(response: &Value) -> Result<Vec<LlmEvent>> {
                     .unwrap_or("")
                     .to_string();
                 let input = block.get("input").cloned().unwrap_or(json!({}));
-                events.push(LlmEvent::ToolUse { id, name, input });
+                events.push(LlmEvent::ToolUse {
+                    id,
+                    name,
+                    input,
+                    thought_signature: None,
+                });
             }
             _ => {}
         }
@@ -307,9 +319,23 @@ impl GeminiProvider {
                     .iter()
                     .map(|b| match b {
                         ContentBlock::Text { text } => json!({ "text": text }),
-                        ContentBlock::ToolUse { name, input, .. } => json!({
-                            "functionCall": { "name": name, "args": input }
-                        }),
+                        ContentBlock::ToolUse {
+                            name,
+                            input,
+                            thought_signature,
+                            ..
+                        } => {
+                            // Gemini 3.x requires thoughtSignature to be echoed
+                            // back on functionCall parts; older models tolerate
+                            // it as a no-op.
+                            let mut part = json!({
+                                "functionCall": { "name": name, "args": input }
+                            });
+                            if let Some(sig) = thought_signature {
+                                part["thoughtSignature"] = json!(sig);
+                            }
+                            part
+                        }
                         ContentBlock::ToolResult {
                             tool_use_id,
                             content,
@@ -458,7 +484,18 @@ fn parse_gemini_response(response: &Value) -> Result<Vec<LlmEvent>> {
                 // Gemini doesn't return a per-call id; synthesize one so the
                 // ToolResult routing in the agent loop has something to match.
                 let id = format!("gem_{}", Uuid::new_v4());
-                events.push(LlmEvent::ToolUse { id, name, input });
+                // Gemini 3.x ships a per-call `thoughtSignature` that the API
+                // requires us to echo back on the next request in the same turn.
+                let thought_signature = part
+                    .get("thoughtSignature")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string());
+                events.push(LlmEvent::ToolUse {
+                    id,
+                    name,
+                    input,
+                    thought_signature,
+                });
             }
         }
     }
@@ -544,7 +581,7 @@ impl LlmProvider for OpenAiProvider {
                             ContentBlock::Text { text } => {
                                 oai_messages.push(json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]}));
                             }
-                            ContentBlock::ToolUse { id, name, input } => {
+                            ContentBlock::ToolUse { id, name, input, .. } => {
                                 oai_messages.push(json!({"type": "function_call", "call_id": id, "name": name, "arguments": input.to_string()}));
                             }
                             _ => {}
@@ -710,7 +747,12 @@ fn parse_openai_response(response: &Value) -> Result<Vec<LlmEvent>> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
                     let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
-                    events.push(LlmEvent::ToolUse { id, name, input });
+                    events.push(LlmEvent::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature: None,
+                    });
                 }
                 _ => {}
             }
@@ -755,7 +797,12 @@ fn parse_openai_response(response: &Value) -> Result<Vec<LlmEvent>> {
                 .and_then(|a| a.as_str())
                 .unwrap_or("{}");
             let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
-            events.push(LlmEvent::ToolUse { id, name, input });
+            events.push(LlmEvent::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature: None,
+            });
         }
     }
 
@@ -800,7 +847,7 @@ mod tests {
         let events = parse_anthropic_response(&resp).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            LlmEvent::ToolUse { id, name, input } => {
+            LlmEvent::ToolUse { id, name, input, .. } => {
                 assert_eq!(id, "tu_1");
                 assert_eq!(name, "read");
                 assert_eq!(input["path"], "/tmp/x");
@@ -852,7 +899,7 @@ mod tests {
         let events = parse_openai_response(&resp).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            LlmEvent::ToolUse { id, name, input } => {
+            LlmEvent::ToolUse { id, name, input, .. } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "read");
                 assert_eq!(input["path"], "x.txt");
@@ -903,7 +950,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], LlmEvent::Text(t) if t == "I'll read it."));
         match &events[1] {
-            LlmEvent::ToolUse { name, input, id } => {
+            LlmEvent::ToolUse { name, input, id, .. } => {
                 assert_eq!(name, "read");
                 assert_eq!(input["path"], "/tmp/x");
                 assert!(id.starts_with("gem_"));
@@ -963,6 +1010,7 @@ mod tests {
                     id: "gem_abc".to_string(),
                     name: "read".to_string(),
                     input: json!({"path": "x.txt"}),
+                    thought_signature: Some("sig_xyz".to_string()),
                 }],
             },
             Message {
@@ -992,5 +1040,39 @@ mod tests {
         );
         // Tools wrapped in functionDeclarations
         assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "read");
+        // Gemini 3.x: thought_signature carried by the assistant ToolUse must
+        // be echoed back on the functionCall part as `thoughtSignature`.
+        assert_eq!(
+            body["contents"][1]["parts"][0]["thoughtSignature"],
+            "sig_xyz"
+        );
+    }
+
+    #[test]
+    fn test_parse_gemini_function_call_captures_thought_signature() {
+        let resp = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {"name": "bash", "args": {"command": "ls"}},
+                            "thoughtSignature": "abc123"
+                        }
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let events = parse_gemini_response(&resp).unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            LlmEvent::ToolUse {
+                thought_signature, ..
+            } => {
+                assert_eq!(thought_signature.as_deref(), Some("abc123"));
+            }
+            _ => panic!("expected ToolUse"),
+        }
     }
 }
