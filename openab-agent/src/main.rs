@@ -39,10 +39,38 @@ enum AuthProvider {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
+    // When OPENAB_AGENT_LOG_FILE is set, route tracing output to that file
+    // (appended). Useful when the agent is spawned by openab, which swallows
+    // child stderr.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("openab_agent=info"));
+    if let Ok(path) = std::env::var("OPENAB_AGENT_LOG_FILE") {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_ansi(false)
+                    .init();
+            }
+            Err(e) => {
+                eprintln!("OPENAB_AGENT_LOG_FILE={path}: open failed ({e}), falling back to stderr");
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::io::stderr)
+                    .init();
+            }
+        }
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    }
 
     let cli = Cli::parse();
 

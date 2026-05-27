@@ -2,6 +2,18 @@ use anyhow::Result;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
+/// Truncate `s` to at most `max_chars` characters (char-safe, not byte-safe),
+/// and replace newlines with `\n` literals for single-line logging.
+fn preview(s: &str, max_chars: usize) -> String {
+    let collapsed: String = s.replace('\n', "\\n");
+    if collapsed.chars().count() <= max_chars {
+        collapsed
+    } else {
+        let head: String = collapsed.chars().take(max_chars).collect();
+        format!("{head}…")
+    }
+}
+
 use crate::llm::{ContentBlock, LlmEvent, LlmProvider, Message, ToolDef};
 use crate::tools;
 
@@ -148,10 +160,16 @@ impl Agent {
             // Execute tool calls and add results
             let mut tool_results: Vec<ContentBlock> = Vec::new();
             for (id, name, input, _sig) in &tool_calls {
-                info!("executing tool: {name}");
+                let input_preview = preview(&input.to_string(), 240);
+                info!("tool call: {name} input={input_preview}");
                 let result = tools::execute_tool(name, input, &self.working_dir).await;
                 match result {
                     Ok(output) => {
+                        info!(
+                            "tool result: {name} ok bytes={} preview={}",
+                            output.len(),
+                            preview(&output, 240)
+                        );
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
                             content: output,
@@ -159,6 +177,7 @@ impl Agent {
                         });
                     }
                     Err(e) => {
+                        info!("tool result: {name} error={e}");
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
                             content: format!("Error: {e}"),
