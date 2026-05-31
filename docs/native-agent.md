@@ -86,7 +86,7 @@ export GEMINI_API_KEY=...   # or GOOGLE_API_KEY
 
 No login needed — set the env var and the agent auto-detects it (after Anthropic,
 before Codex OAuth). Force it explicitly with `OPENAB_AGENT_PROVIDER=gemini`. Pick a
-model with `OPENAB_AGENT_MODEL` (default `gemini-2.0-flash`); requests go to the
+model with `OPENAB_AGENT_MODEL` (default `gemini-2.5-flash`); requests go to the
 Generative Language API (`generativelanguage.googleapis.com`), overridable via
 `OPENAB_AGENT_GEMINI_BASE_URL`.
 
