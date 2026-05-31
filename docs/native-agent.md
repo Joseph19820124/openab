@@ -33,10 +33,12 @@ env = { OPENAB_AGENT_OPENAI_MODEL = "gpt-5.4-mini" }
 |----------|---------|-------------|
 | `OPENAB_AGENT_OPENAI_MODEL` | `gpt-4.1-nano` | Model to use |
 | `OPENAB_AGENT_OPENAI_BASE_URL` | `https://chatgpt.com/backend-api` | API base URL |
-| `OPENAB_AGENT_PROVIDER` | auto-detect | Force provider (`anthropic`, `openai`, `codex`) |
+| `OPENAB_AGENT_PROVIDER` | auto-detect | Force provider (`anthropic`, `gemini`/`google`, `openai`, `codex`) |
 | `OPENAB_AGENT_MAX_TOKENS` | `8192` | Max output tokens |
 | `OPENAB_AGENT_OAUTH_CLIENT_ID` | Pi's client | Custom OAuth client ID |
+| `OPENAB_AGENT_GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta` | Gemini API base URL |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key (alternative to OAuth) |
+| `GEMINI_API_KEY` | — | Google Gemini API key (also accepts `GOOGLE_API_KEY`) |
 
 ## Authentication
 
@@ -75,6 +77,18 @@ export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 No login needed — set the env var and the agent auto-detects it.
+
+### API Key (Google Gemini)
+
+```bash
+export GEMINI_API_KEY=...   # or GOOGLE_API_KEY
+```
+
+No login needed — set the env var and the agent auto-detects it (after Anthropic,
+before Codex OAuth). Force it explicitly with `OPENAB_AGENT_PROVIDER=gemini`. Pick a
+model with `OPENAB_AGENT_MODEL` (default `gemini-2.0-flash`); requests go to the
+Generative Language API (`generativelanguage.googleapis.com`), overridable via
+`OPENAB_AGENT_GEMINI_BASE_URL`.
 
 ## Custom System Prompt
 
