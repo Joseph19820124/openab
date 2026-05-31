@@ -545,6 +545,229 @@ fn parse_openai_response(response: &Value) -> Result<Vec<LlmEvent>> {
     Ok(events)
 }
 
+// === Google Gemini Provider (API key, mirrors AnthropicProvider) ===
+
+/// Google Gemini provider using the Generative Language REST API.
+///
+/// Authenticated with an API key (`GEMINI_API_KEY`, falling back to
+/// `GOOGLE_API_KEY`), exactly like `AnthropicProvider` uses `ANTHROPIC_API_KEY`.
+pub struct GeminiProvider {
+    api_key: String,
+    model: String,
+    max_tokens: u32,
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl GeminiProvider {
+    pub fn from_env() -> Result<Self, String> {
+        // Accept either name — Google's own SDKs read both.
+        let api_key = std::env::var("GEMINI_API_KEY")
+            .or_else(|_| std::env::var("GOOGLE_API_KEY"))
+            .map_err(|_| "GEMINI_API_KEY not set".to_string())?;
+        if api_key.is_empty() {
+            return Err("GEMINI_API_KEY is empty".to_string());
+        }
+        Ok(Self {
+            api_key,
+            model: std::env::var("OPENAB_AGENT_MODEL")
+                .unwrap_or_else(|_| "gemini-2.0-flash".to_string()),
+            max_tokens: std::env::var("OPENAB_AGENT_MAX_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8192),
+            base_url: std::env::var("OPENAB_AGENT_GEMINI_BASE_URL")
+                .unwrap_or_else(|_| "https://generativelanguage.googleapis.com/v1beta".to_string()),
+            client: reqwest::Client::new(),
+        })
+    }
+
+    fn build_request_body(&self, system: &str, messages: &[Message], tools: &[ToolDef]) -> Value {
+        // Map our (Anthropic-shaped) messages onto Gemini `contents`.
+        let contents: Vec<Value> = messages
+            .iter()
+            .map(|m| {
+                let role = if m.role == "assistant" {
+                    "model"
+                } else {
+                    "user"
+                };
+                let parts: Vec<Value> = m
+                    .content
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Text { text } => json!({ "text": text }),
+                        ContentBlock::ToolUse { name, input, .. } => json!({
+                            "functionCall": { "name": name, "args": input }
+                        }),
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => {
+                            // Gemini keys a functionResponse by the function NAME, not
+                            // by an id, so recover the name from the originating
+                            // tool_use block earlier in the conversation.
+                            let name = gemini_tool_name(messages, tool_use_id)
+                                .unwrap_or_else(|| tool_use_id.clone());
+                            let response = if let Some(true) = is_error {
+                                json!({ "error": content })
+                            } else {
+                                json!({ "result": content })
+                            };
+                            json!({
+                                "functionResponse": { "name": name, "response": response }
+                            })
+                        }
+                    })
+                    .collect();
+                json!({ "role": role, "parts": parts })
+            })
+            .collect();
+
+        let mut body = json!({
+            "contents": contents,
+            "systemInstruction": { "parts": [{ "text": system }] },
+            "generationConfig": { "maxOutputTokens": self.max_tokens },
+        });
+
+        if !tools.is_empty() {
+            let decls: Vec<Value> = tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": &t.name,
+                        "description": &t.description,
+                        "parameters": &t.input_schema
+                    })
+                })
+                .collect();
+            body["tools"] = json!([{ "functionDeclarations": decls }]);
+        }
+
+        body
+    }
+}
+
+/// Find the tool name for a given synthesized tool_use id by scanning prior
+/// `ToolUse` blocks (Gemini function calls carry no id of their own).
+fn gemini_tool_name(messages: &[Message], id: &str) -> Option<String> {
+    for m in messages {
+        for b in &m.content {
+            if let ContentBlock::ToolUse { id: tid, name, .. } = b {
+                if tid == id {
+                    return Some(name.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+impl LlmProvider for GeminiProvider {
+    fn chat<'a>(
+        &'a self,
+        system: &'a str,
+        messages: &'a [Message],
+        tools: &'a [ToolDef],
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
+        Box::pin(async move {
+            let body = self.build_request_body(system, messages, tools);
+            let url = format!("{}/models/{}:generateContent", self.base_url, self.model);
+            let max_retries = 3u32;
+
+            for attempt in 0..=max_retries {
+                let resp = self
+                    .client
+                    .post(&url)
+                    .header("x-goog-api-key", &self.api_key)
+                    .header("content-type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
+
+                let status = resp.status();
+
+                // Retry on 429 (rate limit) or 503 (overloaded / unavailable)
+                if (status.as_u16() == 429 || status.as_u16() == 503) && attempt < max_retries {
+                    let delay = std::time::Duration::from_millis(1000 * 2u64.pow(attempt));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("Gemini API error {status}: {text}"));
+                }
+
+                let response: Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| anyhow!("Failed to parse response: {e}"))?;
+
+                return parse_gemini_response(&response);
+            }
+
+            Err(anyhow!("Gemini API: max retries exceeded"))
+        })
+    }
+}
+
+fn parse_gemini_response(response: &Value) -> Result<Vec<LlmEvent>> {
+    let mut events = Vec::new();
+
+    // Gemini can return an error envelope even with HTTP 200.
+    if let Some(err) = response.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        return Err(anyhow!("Gemini API error: {msg}"));
+    }
+
+    let candidate = response
+        .get("candidates")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .ok_or_else(|| anyhow!("missing candidates in response"))?;
+
+    let mut tool_call_count = 0usize;
+
+    if let Some(parts) = candidate
+        .get("content")
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
+    {
+        for (idx, part) in parts.iter().enumerate() {
+            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                if !text.is_empty() {
+                    events.push(LlmEvent::Text(text.to_string()));
+                }
+            } else if let Some(fc) = part.get("functionCall") {
+                let name = fc
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let input = fc.get("args").cloned().unwrap_or(json!({}));
+                // Synthesize a stable, unique id so the agent loop can pair the
+                // eventual tool_result back to this call.
+                let id = format!("call_{name}_{idx}");
+                events.push(LlmEvent::ToolUse { id, name, input });
+                tool_call_count += 1;
+            }
+        }
+    }
+
+    // Mirror Anthropic: only emit Stop when not awaiting tool results.
+    if tool_call_count == 0 {
+        events.push(LlmEvent::Stop);
+    }
+
+    Ok(events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,5 +863,140 @@ mod tests {
     fn test_parse_openai_empty_choices() {
         let resp = json!({"choices": []});
         assert!(parse_openai_response(&resp).is_err());
+    }
+
+    fn gemini_provider() -> GeminiProvider {
+        GeminiProvider {
+            api_key: "test".to_string(),
+            model: "gemini-2.0-flash".to_string(),
+            max_tokens: 4096,
+            base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    #[test]
+    fn test_gemini_build_request_body_maps_roles_and_tools() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "hello".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_bash_0".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({ "command": "ls" }),
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_bash_0".to_string(),
+                    content: "file.txt".to_string(),
+                    is_error: None,
+                }],
+            },
+        ];
+        let tools = vec![ToolDef {
+            name: "bash".to_string(),
+            description: "run a command".to_string(),
+            input_schema: json!({ "type": "object" }),
+        }];
+        let body = gemini_provider().build_request_body("system prompt", &messages, &tools);
+
+        // role mapping: user stays user, assistant -> model
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["contents"][1]["role"], "model");
+        // tool_use -> functionCall
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionCall"]["name"],
+            "bash"
+        );
+        // tool_result -> functionResponse keyed by recovered NAME (not the id)
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "bash"
+        );
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["response"]["result"],
+            "file.txt"
+        );
+        // system instruction + tool declaration shape
+        assert_eq!(
+            body["systemInstruction"]["parts"][0]["text"],
+            "system prompt"
+        );
+        assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "bash");
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 4096);
+    }
+
+    #[test]
+    fn test_gemini_tool_result_error_maps_to_error_field() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "unknown".to_string(),
+                content: "boom".to_string(),
+                is_error: Some(true),
+            }],
+        }];
+        let body = gemini_provider().build_request_body("sys", &messages, &[]);
+        // No matching tool_use -> falls back to the id as the name
+        assert_eq!(
+            body["contents"][0]["parts"][0]["functionResponse"]["name"],
+            "unknown"
+        );
+        assert_eq!(
+            body["contents"][0]["parts"][0]["functionResponse"]["response"]["error"],
+            "boom"
+        );
+    }
+
+    #[test]
+    fn test_parse_gemini_text_response() {
+        let resp = json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": "Hello world" }] }
+            }]
+        });
+        let events = parse_gemini_response(&resp).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], LlmEvent::Text(t) if t == "Hello world"));
+        assert!(matches!(events[1], LlmEvent::Stop));
+    }
+
+    #[test]
+    fn test_parse_gemini_function_call_response() {
+        let resp = json!({
+            "candidates": [{
+                "content": { "parts": [
+                    { "text": "let me read that" },
+                    { "functionCall": { "name": "read", "args": { "path": "x.txt" } } }
+                ]}
+            }]
+        });
+        let events = parse_gemini_response(&resp).unwrap();
+        // text + tool use, and NO Stop (awaiting tool result)
+        assert!(matches!(&events[0], LlmEvent::Text(_)));
+        match &events[1] {
+            LlmEvent::ToolUse { id, name, input } => {
+                assert_eq!(name, "read");
+                assert_eq!(id, "call_read_1");
+                assert_eq!(input["path"], "x.txt");
+            }
+            _ => panic!("expected ToolUse event"),
+        }
+        assert!(!events.iter().any(|e| matches!(e, LlmEvent::Stop)));
+    }
+
+    #[test]
+    fn test_parse_gemini_error_envelope() {
+        let resp = json!({ "error": { "message": "API key not valid" } });
+        let err = parse_gemini_response(&resp).unwrap_err();
+        assert!(err.to_string().contains("API key not valid"));
     }
 }
